@@ -1,0 +1,50 @@
+{
+  "name": "esuyo-opencode-custom-provider",
+  "version": "0.1.0",
+  "description": "Opencode plugin to auto-discover models from any OpenAI-compatible gateway",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "opencode",
+    "plugin",
+    "openai",
+    "gateway",
+    "ai"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Esuyo/esuyo-opencode-custom-provider.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Esuyo/esuyo-opencode-custom-provider/issues"
+  },
+  "homepage": "https://github.com/Esuyo/esuyo-opencode-custom-provider#readme",
+  "peerDependencies": {
+    "@opencode-ai/plugin": "^1.18.25"
+  },
+  "devDependencies": {
+    "@opencode-ai/plugin": "1.18.25",
+    "@types/node": "^26.4.0",
+    "typescript": "^5.7.3"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
