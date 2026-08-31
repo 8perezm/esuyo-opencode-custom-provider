@@ -28,7 +28,7 @@ Project overrides global; env overrides all.
   "$schema": "https://opencode.ai/config.json",
   "providers": {
     "esuyo-gateway": {
-      "baseURL": "https://ai-gateway.foo.esuyo.com/v1",
+      "baseURL": "https://gateway.example.com/v1",
       "apiKey": "{env:ESUYO_GATEWAY_API_KEY}"
     }
   }

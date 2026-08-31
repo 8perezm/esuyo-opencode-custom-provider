@@ -4,7 +4,7 @@
 
 > If you can copy and paste, you can do this — even if you're 10.
 
-This tiny plugin finds all the models from your AI gateway (like Esuyo, OpenAI-compatible APIs) and adds them to Opencode for you, every time you start Opencode. You tell it *where* your gateway is, it does the rest.
+This tiny plugin finds all the models from your AI gateway and adds them to Opencode for you, every time you start Opencode. You tell it *where* your gateway is, it does the rest.
 
 ---
 
@@ -61,7 +61,7 @@ Paste this inside (replace the `baseURL` with yours):
   "providers": {
     "esuyo-gateway": {
       "name": "Esuyo Gateway",
-      "baseURL": "https://ai-gateway.foo.esuyo.com/v1",
+      "baseURL": "https://gateway.example.com/v1",
       "apiKey": "{env:ESUYO_GATEWAY_API_KEY}"
     }
   }
@@ -129,7 +129,7 @@ You can filter models, set timeouts, or add a second gateway. It’s all optiona
   "providers": {
     "esuyo-gateway": {
       "name": "Esuyo Gateway",
-      "baseURL": "https://ai-gateway.foo.esuyo.com/v1",
+      "baseURL": "https://gateway.example.com/v1",
       "apiKey": "{env:ESUYO_GATEWAY_API_KEY}",
       "include": ["^esuyo/.*"],
       "exclude": ["embedding"]
