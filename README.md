@@ -2,15 +2,15 @@
 
 Opencode plugin that auto-discovers models from any OpenAI-compatible gateway on every `opencode` start. No more manually maintaining `opencode.json` models.
 
-Published as `esuyo-opencode-custom-provider` on npm. Install via `opencode` plugin system.
+Published as `@esuyo/esuyo-opencode-custom-provider` on npm. Install via `opencode` plugin system.
 
 ## Install
 
 ```bash
 # once published
-npm install esuyo-opencode-custom-provider
+npm install @esuyo/esuyo-opencode-custom-provider
 # or via opencode
-opencode plugin add esuyo-opencode-custom-provider
+opencode plugin add @esuyo/esuyo-opencode-custom-provider
 ```
 
 Then add to your `opencode.json`:
@@ -18,7 +18,7 @@ Then add to your `opencode.json`:
 ```json
 {
   "$schema": "https://opencode.ai/config.json",
-  "plugin": ["esuyo-opencode-custom-provider"]
+  "plugin": ["@esuyo/esuyo-opencode-custom-provider"]
 }
 ```
 

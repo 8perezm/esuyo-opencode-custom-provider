@@ -1,5 +1,5 @@
 {
-  "name": "esuyo-opencode-custom-provider",
+  "name": "@esuyo/esuyo-opencode-custom-provider",
   "version": "0.2.4",
   "description": "Opencode plugin to auto-discover models from any OpenAI-compatible gateway",
   "type": "module",
