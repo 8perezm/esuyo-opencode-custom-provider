@@ -578,6 +578,8 @@ export const OpencodeCustomProviderPlugin: Plugin = async ({ client, directory }
             await log("warn", `No apiKey for ${providerId} - attempting unauthenticated`, { providerId, baseURL, hint: `Set apiKey or apiKeyEnv in custom config or ${providerId.toUpperCase()}_API_KEY env` })
           } else {
             await log("debug", `Using apiKey for ${providerId}`, { providerId, baseURL, hasKey: true })
+            // Persist apiKey for LLM requests - provider chat needs options.apiKey
+            if (provider.options) provider.options.apiKey = apiKey
           }
 
           const existingModels: Record<string, any> = provider.models ?? {}
