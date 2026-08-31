@@ -30,12 +30,12 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/Esuyo/esuyo-opencode-custom-provider.git"
+    "url": "git+https://github.com/8perezm/esuyo-opencode-custom-provider.git"
   },
   "bugs": {
-    "url": "https://github.com/Esuyo/esuyo-opencode-custom-provider/issues"
+    "url": "https://github.com/8perezm/esuyo-opencode-custom-provider/issues"
   },
-  "homepage": "https://github.com/Esuyo/esuyo-opencode-custom-provider#readme",
+  "homepage": "https://github.com/8perezm/esuyo-opencode-custom-provider#readme",
   "peerDependencies": {
     "@opencode-ai/plugin": "^1.18.25"
   },
