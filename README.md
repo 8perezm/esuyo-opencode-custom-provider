@@ -96,4 +96,4 @@ Push to `main` triggers `.github/workflows/publish.yml`:
 
 MIT
 
-
+---
