@@ -1,5 +1,6 @@
 import type { Plugin } from "@opencode-ai/plugin"
 import fs from "node:fs/promises"
+import os from "node:os"
 import path from "node:path"
 
 // ---------------------------------------------------------------------------
@@ -284,7 +285,36 @@ async function loadCustomConfig(
     path.join(directory, "opencode-custom-provider.jsonc"),
   ]
 
-  // env override
+  // global fallback: ~/.config/opencode/esuyo-opencode-custom-provider.json (and variants)
+  // checked after project-level files so project overrides global
+  try {
+    const home = os.homedir()
+    const xdg = process.env.XDG_CONFIG_HOME
+    const globalBase = xdg ? path.join(xdg, "opencode") : path.join(home, ".config", "opencode")
+    if (home || xdg) {
+      candidates.push(
+        path.join(globalBase, "esuyo-opencode-custom-provider.json"),
+        path.join(globalBase, "esuyo-opencode-custom-provider.jsonc"),
+        path.join(globalBase, "opencode-custom-provider.json"),
+        path.join(globalBase, "opencode-custom-provider.jsonc"),
+        path.join(globalBase, "custom-providers.json"),
+        path.join(globalBase, "custom-providers.jsonc"),
+      )
+      // Windows also checks %APPDATA%\opencode if different from ~/.config/opencode
+      const appData = process.env.APPDATA
+      if (appData) {
+        const winBase = path.join(appData, "opencode")
+        if (winBase !== globalBase) {
+          candidates.push(
+            path.join(winBase, "esuyo-opencode-custom-provider.json"),
+            path.join(winBase, "esuyo-opencode-custom-provider.jsonc"),
+          )
+        }
+      }
+    }
+  } catch {}
+
+  // env override (highest priority)
   const envPath = env["OPENCODE_CUSTOM_PROVIDER_CONFIG"] ?? process.env["OPENCODE_CUSTOM_PROVIDER_CONFIG"]
   if (envPath) candidates.unshift(envPath)
 
