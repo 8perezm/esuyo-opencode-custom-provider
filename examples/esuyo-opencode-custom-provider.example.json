@@ -31,6 +31,7 @@
       "baseURL": "https://other.example.com/v1",
       "apiKey": "{env:SECOND_GATEWAY_API_KEY}",
       "timeoutMs": 5000,
+      "sendSessionHeaders": false,
       "include": [
         "^esuyo/.*"
       ],
@@ -38,5 +39,9 @@
         "embedding"
       ]
     }
+  },
+  "sessionHeaders": {
+    "enabled": true,
+    "header": "x-opencode-session"
   }
 }

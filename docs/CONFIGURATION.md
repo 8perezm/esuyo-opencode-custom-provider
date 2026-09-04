@@ -133,3 +133,40 @@ Override per-provider via `modelDefaults`.
 ## Comments in JSON
 
 `.jsonc` files support `//` and `/* */` comments (`src/index.ts:176` strips them).
+
+## Session headers (OpenCode Go/Zen compliance)
+
+Opencode core only sends `x-opencode-session` for first-party `opencode*`
+providers. Custom gateways get `x-session-affinity` / `X-Session-Id` instead —
+which OpenCode Go flags as missing (may error after 09/06).
+
+This plugin backfills `x-opencode-session: <opencode sessionID>` via the
+`chat.headers` hook for every provider it manages. Enabled by default;
+first-party `opencode*` providers are skipped (core already handles them) and
+unrelated providers (e.g. `anthropic` direct) are never touched.
+
+```json
+{
+  "sessionHeaders": {
+    "enabled": true,
+    "header": "x-opencode-session",
+    "providers": ["esuyo-gateway"]
+  },
+  "providers": {
+    "esuyo-gateway": {
+      "baseURL": "https://gateway.example.com/v1",
+      "apiKey": "{env:ESUYO_GATEWAY_API_KEY}"
+    }
+  }
+}
+```
+
+Options:
+
+| Key | Default | Meaning |
+|---|---|---|
+| `sessionHeaders` | enabled | `false` disables injection entirely; `true`/omitted uses defaults |
+| `sessionHeaders.header` | `"x-opencode-session"` | header name to inject |
+| `sessionHeaders.providers` | all managed providers | allowlist — only these provider IDs get the header (also opts in unmanaged IDs) |
+| `providers.<id>.sendSessionHeaders` | `true` | per-provider opt-out: `false` leaves that provider untouched |
+| `providers.<id>.sessionHeader` | global header | per-provider header name override |

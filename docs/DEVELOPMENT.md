@@ -66,14 +66,23 @@ npm link @esuyo/esuyo-opencode-custom-provider
 # add to opencode.json plugin: ["@esuyo/esuyo-opencode-custom-provider"]
 ```
 
-### Verifying
+### Verifying session headers (`x-opencode-session`)
+
+`scripts/echo-gateway.mjs` is a header-dump stub (no deps). It serves
+`/v1/models` (`echo-model`) and `/v1/chat/completions`, logging
+`x-opencode-session` per request:
 
 ```bash
-# check merged config + discovered models
+npm run echo-gateway -- --port 4311
+# in esuyo-opencode-custom-provider.json add:
+# { "providers": { "echo-test": { "baseURL": "http://127.0.0.1:4311/v1", "apiKey": "test" } } }
 opencode debug config
-# check plugin logs
-opencode --print-logs 2>&1 | Select-String "opencode-custom-provider"
+opencode run "say hi" --model echo-test/echo-model
 ```
+
+Every `POST /chat/completions` line should show `x-opencode-session: ses_...`.
+`(MISSING)` means the hook isn't firing (plugin not loaded, provider not
+managed, or `sessionHeaders: false`). Ctrl+C prints a pass/fail summary.
 
 Logs are via `client.app.log({ service: "opencode-custom-provider" })` at `src/index.ts:464`.
 

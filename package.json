@@ -18,6 +18,7 @@
     "build": "tsc",
     "dev": "tsc --watch",
     "typecheck": "tsc --noEmit",
+    "echo-gateway": "node scripts/echo-gateway.mjs",
     "prepublishOnly": "npm run build"
   },
   "keywords": [

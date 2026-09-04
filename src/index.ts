@@ -25,6 +25,17 @@ type ModelDefaults = {
   limit?: { context: number; output: number; input?: number }
 }
 
+type SessionHeadersConfig = {
+  enabled?: boolean
+  /** Header name to inject (default "x-opencode-session" as required by OpenCode Go/Zen). */
+  header?: string
+  /**
+   * Optional allowlist of provider IDs to inject for. Default: all providers
+   * managed by this plugin. Useful to target a single gateway.
+   */
+  providers?: string[]
+}
+
 type ProviderEntry = {
   id?: string
   name?: string
@@ -40,6 +51,14 @@ type ProviderEntry = {
   exclude?: string[]
   // optional static model overrides merged after discovery
   models?: Record<string, Record<string, any>>
+  /**
+   * Per-provider opt-out for the x-opencode-session injection
+   * (default true — inherits the global sessionHeaders setting).
+   * Set to false to leave this provider's headers untouched.
+   */
+  sendSessionHeaders?: boolean
+  /** Override the injected header name for this provider only. */
+  sessionHeader?: string
 }
 
 type CustomConfigFile = {
@@ -50,9 +69,18 @@ type CustomConfigFile = {
     modelDefaults?: ModelDefaults
   }
   providers?: Record<string, ProviderEntry> | ProviderEntry[]
+  /**
+   * Session-header injection for OpenCode Go/Zen compliance.
+   * - `false` disables entirely (no x-opencode-session is added).
+   * - `true` / omitted enables with defaults (all managed providers).
+   * - object form allows renaming the header or restricting providers.
+   */
+  sessionHeaders?: boolean | SessionHeadersConfig
   // also support top-level being directly providers map/array if no wrapper
   [key: string]: any
 }
+
+const DEFAULT_SESSION_HEADER = "x-opencode-session"
 
 // ---------------------------------------------------------------------------
 // helpers
@@ -480,6 +508,44 @@ export const OpencodeCustomProviderPlugin: Plugin = async ({ client, directory }
     return models
   }
 
+  // ---------------------------------------------------------------------------
+  // x-opencode-session injection state (OpenCode Go/Zen compliance)
+  // Opencode core only sends x-opencode-session for providerIDs starting with
+  // "opencode"; custom gateways get x-session-affinity/X-Session-Id instead.
+  // The chat.headers hook below backfills x-opencode-session with the current
+  // opencode sessionID so gateways proxying to Go stay compliant after 09/06.
+  // Populated by the config hook; read by the chat.headers hook.
+  // ---------------------------------------------------------------------------
+  const managedProviderIds = new Set<string>()
+  let sessionHeadersEnabled = true
+  let sessionHeaderName = DEFAULT_SESSION_HEADER
+  let sessionHeaderAllowlist: Set<string> | null = null
+  const perProviderSessionOpts = new Map<string, { enabled: boolean; header?: string }>()
+
+  function applySessionHeadersConfig(raw: CustomConfigFile | undefined): void {
+    const cfg = raw?.sessionHeaders
+    sessionHeadersEnabled = true
+    sessionHeaderName = DEFAULT_SESSION_HEADER
+    sessionHeaderAllowlist = null
+    if (cfg === false) {
+      sessionHeadersEnabled = false
+      return
+    }
+    if (cfg === true || cfg === undefined) return
+    if (typeof cfg === "object" && cfg !== null) {
+      if ((cfg as SessionHeadersConfig).enabled === false) {
+        sessionHeadersEnabled = false
+        return
+      }
+      const header = (cfg as SessionHeadersConfig).header
+      if (typeof header === "string" && header.trim()) sessionHeaderName = header.trim()
+      const providers = (cfg as SessionHeadersConfig).providers
+      if (Array.isArray(providers) && providers.length > 0) {
+        sessionHeaderAllowlist = new Set(providers.filter((p) => typeof p === "string" && p.trim()).map((p) => p.trim()))
+      }
+    }
+  }
+
   return {
     config: async (config) => {
       try {
@@ -488,7 +554,8 @@ export const OpencodeCustomProviderPlugin: Plugin = async ({ client, directory }
 
         const env: Record<string, string | undefined> = (typeof process !== "undefined" ? (process.env as any) : {}) as any
 
-        const { config: providers, path: configPath } = await loadCustomConfig(directory, env, log)
+        const { config: providers, path: configPath, raw: rawJson } = await loadCustomConfig(directory, env, log)
+        applySessionHeadersConfig(rawJson)
 
         // Fallback: if no custom config, sync providers already in opencode.json that have baseURL and no explicit models or dynamic flag
         // This keeps backward compat with existing esuyo-gateway hard-coded in opencode.json
@@ -518,6 +585,23 @@ export const OpencodeCustomProviderPlugin: Plugin = async ({ client, directory }
 
         const disabled: string[] = (config as any).disabled_providers ?? []
         const enabledAllow: string[] | null = (config as any).enabled_providers ? [...(config as any).enabled_providers] : null
+
+        // Seed per-provider session-header opts (config hook runs before any
+        // chat.headers call, so the headers hook can rely on this map).
+        // Seed the managed set here too (not only after a successful fetch)
+        // so injection still works when the gateway is unreachable and the
+        // plugin keeps existing models.
+        perProviderSessionOpts.clear()
+        managedProviderIds.clear()
+        for (const [pid, pentry] of Object.entries(providerEntries)) {
+          perProviderSessionOpts.set(pid, {
+            enabled: (pentry as ProviderEntry).sendSessionHeaders !== false,
+            header: typeof (pentry as ProviderEntry).sessionHeader === "string" && (pentry as ProviderEntry).sessionHeader!.trim()
+              ? (pentry as ProviderEntry).sessionHeader!.trim()
+              : undefined,
+          })
+          managedProviderIds.add(pid)
+        }
 
         // Prepare sync tasks in parallel
         const tasks = Object.entries(providerEntries).map(async ([providerId, entry]) => {
@@ -640,6 +724,7 @@ export const OpencodeCustomProviderPlugin: Plugin = async ({ client, directory }
           if (removed.length > 0) await log("info", `Removing ${removed.length} stale models for ${providerId}`, { providerId, removed })
 
           provider.models = nextModels
+          managedProviderIds.add(providerId)
           await log("info", `Provider ${providerId} models synced`, { providerId, total: discovered.length, added, reused, removed: removed.length })
         })
 
@@ -647,6 +732,36 @@ export const OpencodeCustomProviderPlugin: Plugin = async ({ client, directory }
         await log("info", "Opencode Custom Provider sync complete", { providers: Object.keys(providerEntries) })
       } catch (err: any) {
         await log("error", `Unexpected error: ${err?.message ?? String(err)}`, { error: String(err?.stack ?? err) })
+      }
+    },
+
+    "chat.headers": async (input, output) => {
+      try {
+        if (!sessionHeadersEnabled) return
+        const sessionID = (input as { sessionID?: unknown }).sessionID
+        if (typeof sessionID !== "string" || !sessionID) return
+        const model = (input as { model?: { providerID?: unknown } }).model
+        const providerCtx = (input as { provider?: { info?: { id?: unknown } } }).provider
+        const providerID =
+          (typeof model?.providerID === "string" && model.providerID) ||
+          (typeof providerCtx?.info?.id === "string" && (providerCtx.info.id as string)) ||
+          ""
+        if (!providerID) return
+        // Opencode core already sends x-opencode-session for first-party
+        // opencode providers — setting it again to the same sessionID is a
+        // harmless no-op, so just skip them and only backfill custom gateways.
+        if (providerID.startsWith("opencode")) return
+        if (sessionHeaderAllowlist && !sessionHeaderAllowlist.has(providerID)) return
+        // Default scope: only providers managed by this plugin, so we never
+        // touch the user's unrelated providers (anthropic, openai, ...).
+        // An explicit sessionHeaders.providers allowlist opts in unmanaged IDs.
+        if (!sessionHeaderAllowlist && !managedProviderIds.has(providerID)) return
+        const perProvider = perProviderSessionOpts.get(providerID)
+        if (perProvider && perProvider.enabled === false) return
+        const headerName = perProvider?.header || sessionHeaderName || DEFAULT_SESSION_HEADER
+        output.headers[headerName] = sessionID
+      } catch {
+        // header injection must never break the request
       }
     },
   }
