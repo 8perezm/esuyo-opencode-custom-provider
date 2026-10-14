@@ -6,6 +6,9 @@
 
 This tiny plugin finds all the models from your AI gateway and adds them to Opencode for you, every time you start Opencode. You tell it *where* your gateway is, it does the rest.
 
+> **Requires Opencode 2** (`opencode --version` should show `2.x`).
+> Still on Opencode 1? Install `@esuyo/esuyo-opencode-custom-provider@0.3.5` instead — version `0.4.0` and above only work with Opencode 2.
+
 ---
 
 ### Why you'll love it
@@ -90,10 +93,10 @@ Restart your terminal after this.
 ### Step 4 — Check it works 🎉
 
 ```bash
-opencode debug config
+opencode models
 ```
 
-You should see a new section called `esuyo-gateway` with a list of models like `esuyo/opencode/qwen3.8-flash`. If you see that, you did it!
+You should see models like `esuyo-gateway/esuyo/opencode/qwen3.8-flash` in the list. If you see those, you did it!
 
 If not, see [“Help, it doesn’t work”](#-help-it-doesnt-work) below.
 
@@ -112,7 +115,7 @@ You never touch the list again.
 
 You don’t need both. Start with global.
 
-> **Super power:** You can also set `OPENCODE_CUSTOM_PROVIDER_CONFIG` to point to any file you want. Project > Global > this env var wins above all.
+> **Super power:** You can also set `OPENCODE_CUSTOM_PROVIDER_CONFIG` to point to any file you want. That env var wins above all, then project, then global.
 
 ## 🔧 Want more control?
 
@@ -123,7 +126,7 @@ You can filter models, set timeouts, or add a second gateway. It’s all optiona
 ```json
 {
   "defaults": {
-    "npm": "@ai-sdk/openai-compatible",
+    "npm": "@opencode/ai/providers/openai-compatible",
     "timeoutMs": 8000
   },
   "providers": {
@@ -158,11 +161,12 @@ When we release a new version, run:
 opencode plugin update @esuyo/esuyo-opencode-custom-provider
 ```
 
-Or if that doesn’t work:
+Or if that doesn’t work (Opencode caches downloads — this forces a fresh one):
 
 ```powershell
-Remove-Item -Recurse -Force "$HOME\.cache\opencode\packages" -ErrorAction SilentlyContinue
-opencode debug config
+Remove-Item -Recurse -Force "$HOME\.cache\opencode\npm\@esuyo" -ErrorAction SilentlyContinue
+opencode service restart
+opencode models
 ```
 
 That’s from the official docs: [opencode.ai/v2/docs/plugins](https://opencode.ai/v2/docs/plugins).
@@ -175,18 +179,23 @@ That’s from the official docs: [opencode.ai/v2/docs/plugins](https://opencode.
 
 ## 🆘 Help, it doesn’t work!
 
-**1. I ran `opencode debug config` and don’t see `esuyo-gateway`:**
+**1. I ran `opencode models` and don’t see `esuyo-gateway/…`:**
 
 - Did you create the file at the *exact* path? Check for typos: `esuyo-opencode-custom-provider.json` (not `.txt`).
 - Did you set the API key and **restart** your terminal? Run `$env:ESUYO_GATEWAY_API_KEY` (Windows) or `echo $ESUYO_GATEWAY_API_KEY` (Mac) to see it.
 - Is your `baseURL` reachable? Try opening `https://your-gateway/v1/models` in a browser.
+- Still nothing? The plugin syncs in the background after startup — wait a few seconds and run `opencode models` again. (If Opencode itself just updated, run `opencode service restart` once.)
 
-**2. It says `Gateway fetch failed`:**
+**2. `/plugins` in Opencode shows an error for this plugin:**
+
+- `Plugin must export a default definition…` means you installed version `0.3.5` or older on Opencode 2. Run `opencode plugin update @esuyo/esuyo-opencode-custom-provider` to get a 2.x release.
+
+**3. It says `Gateway fetch failed`:**
 
 - Your gateway might be down, or the `baseURL` is wrong (missing `/v1`).
-- Your `apiKey` might be wrong. The plugin tries several env names: `ESUYO_GATEWAY_API_KEY`, then `<PROVIDER_ID>_API_KEY`. Check with `opencode --print-logs`.
+- Your `apiKey` might be wrong. The plugin tries several env names: `ESUYO_GATEWAY_API_KEY`, then `<PROVIDER_ID>_API_KEY`. Check with `opencode models --standalone --print-logs`.
 
-**3. I see models but not the one I want:**
+**4. I see models but not the one I want:**
 
 - Add `"include"` or remove `"exclude"` filters in your JSON.
 
