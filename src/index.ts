@@ -1,15 +1,20 @@
-import type { Plugin } from "@opencode-ai/plugin"
+import { Model, Plugin, Provider } from "@opencode/plugin"
 import fs from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
 
 // ---------------------------------------------------------------------------
-// Opencode Custom Provider - generic multi-gateway plugin for 1.18.25
-// Reads its own JSON file and syncs each gateway on startup via `config` hook
+// Esuyo Custom Provider - generic multi-gateway plugin for Opencode V2
+// Reads its own JSON file and syncs each gateway on startup via
+// `ctx.provider.transform`. V1 (`@opencode-ai/plugin`, `config` hook) is
+// no longer supported by the Opencode V2 server, which requires a default
+// export of `{ id, setup }` (or `{ id, effect }`).
 // ---------------------------------------------------------------------------
 
+const PLUGIN_ID = "esuyo-custom-provider"
 const SERVICE = "opencode-custom-provider"
-const DEFAULT_NPM = "@ai-sdk/openai-compatible"
+const DEFAULT_PACKAGE = "@opencode/ai/providers/openai-compatible"
+const LEGACY_PACKAGE = "@ai-sdk/openai-compatible"
 const DEFAULT_TIMEOUT_MS = 8000
 const DEFAULT_MODEL_LIMIT = { context: 200000, output: 32000 }
 const DEFAULT_MODALITIES = { input: ["text", "image"], output: ["text"] } as const
@@ -40,6 +45,8 @@ type ProviderEntry = {
   id?: string
   name?: string
   npm?: string
+  /** V2 alias for npm. */
+  package?: string
   baseURL: string
   apiKey?: string
   apiKeyEnv?: string
@@ -65,6 +72,7 @@ type CustomConfigFile = {
   $schema?: string
   defaults?: {
     npm?: string
+    package?: string
     timeoutMs?: number
     modelDefaults?: ModelDefaults
   }
@@ -83,7 +91,7 @@ type CustomConfigFile = {
 const DEFAULT_SESSION_HEADER = "x-opencode-session"
 
 // ---------------------------------------------------------------------------
-// helpers
+// helpers (unchanged from V1 — pure Node, no Opencode API)
 // ---------------------------------------------------------------------------
 
 function humanizeModelId(id: string): string {
@@ -108,6 +116,13 @@ function resolveModelsUrl(baseURL: string): string {
   if (trimmed.endsWith("/v1")) return `${trimmed}/models`
   if (trimmed.includes("/v1")) return `${trimmed}/models`
   return `${trimmed}/v1/models`
+}
+
+function toV2Package(npm: string | undefined): string {
+  if (!npm || !npm.trim()) return DEFAULT_PACKAGE
+  const trimmed = npm.trim()
+  if (trimmed === LEGACY_PACKAGE) return DEFAULT_PACKAGE
+  return trimmed
 }
 
 function resolveStringValue(
@@ -161,7 +176,7 @@ async function resolveStringValueAsync(
 
 async function resolveApiKeyAsync(
   entry: ProviderEntry,
-  providerOptions: Record<string, any> | undefined,
+  providerSettings: Record<string, any> | undefined,
   env: Record<string, string | undefined>,
 ): Promise<string | undefined> {
   // 1. entry.apiKey (supports {env:}, {file:})
@@ -177,11 +192,12 @@ async function resolveApiKeyAsync(
     const v = env[entry.apiKeyEnv] ?? process.env[entry.apiKeyEnv]
     if (v && v.trim() && v.trim() !== "none") return v.trim()
   }
-  // 3. providerOptions.apiKey (opencode.json fallback, already resolved by opencode env substitution but handle placeholder)
-  if (providerOptions?.apiKey) {
-    const v = await resolveStringValueAsync(providerOptions.apiKey as string, env)
+  // 3. existing provider settings.apiKey (V2) or legacy options.apiKey (V1 fallback)
+  const settingsKey = providerSettings?.apiKey ?? providerSettings?.api_key
+  if (typeof settingsKey === "string" && settingsKey) {
+    const v = await resolveStringValueAsync(settingsKey, env)
     if (v) return v
-    const plain = resolveStringValue(providerOptions.apiKey as string, env)
+    const plain = resolveStringValue(settingsKey, env)
     if (plain) return plain
   }
   // 4. common env fallbacks per provider id
@@ -221,7 +237,7 @@ function normalizeProviders(
   // Support file being directly a providers map without wrapper: { "esuyo-gateway": {baseURL...}}
   if (!providersRaw) {
     // if raw has no providers key but looks like a map of provider entries (has baseURL)
-    const keys = Object.keys(raw).filter((k) => !k.startsWith("$") && k !== "defaults")
+    const keys = Object.keys(raw).filter((k) => !k.startsWith("$") && k !== "defaults" && k !== "sessionHeaders")
     const maybeMap = keys.some((k) => {
       const v = (raw as any)[k]
       return v && typeof v === "object" && typeof v.baseURL === "string"
@@ -236,25 +252,35 @@ function normalizeProviders(
 
   if (!providersRaw) return out
 
+  const applyDefaults = (entry: ProviderEntry): ProviderEntry => ({
+    ...entry,
+    npm: entry.npm ?? entry.package ?? defaults?.npm ?? defaults?.package,
+    timeoutMs: entry.timeoutMs ?? defaults?.timeoutMs,
+    modelDefaults: entry.modelDefaults ?? defaults?.modelDefaults,
+  })
+
   if (Array.isArray(providersRaw)) {
     for (const entry of providersRaw) {
       if (!entry || typeof entry !== "object" || typeof entry.baseURL !== "string") continue
-      const id = (entry.id ?? entry.providerId ?? "").trim()
+      const id = (entry.id ?? (entry as any).providerId ?? "").trim()
       if (!id) continue
-      out[id] = {
+      out[id] = applyDefaults({
         id,
         name: entry.name,
-        npm: entry.npm ?? defaults?.npm,
+        npm: entry.npm ?? (entry as any).package,
+        package: (entry as any).package ?? entry.npm,
         baseURL: entry.baseURL,
         apiKey: entry.apiKey,
         apiKeyEnv: entry.apiKeyEnv,
-        timeoutMs: entry.timeoutMs ?? defaults?.timeoutMs,
+        timeoutMs: entry.timeoutMs,
         enabled: entry.enabled,
-        modelDefaults: entry.modelDefaults ?? defaults?.modelDefaults,
+        modelDefaults: entry.modelDefaults,
         include: entry.include,
         exclude: entry.exclude,
         models: entry.models,
-      }
+        sendSessionHeaders: (entry as any).sendSessionHeaders,
+        sessionHeader: (entry as any).sessionHeader,
+      })
     }
   } else if (typeof providersRaw === "object") {
     for (const [key, val] of Object.entries(providersRaw as Record<string, any>)) {
@@ -263,31 +289,38 @@ function normalizeProviders(
       if (typeof entry.baseURL !== "string" || !entry.baseURL.trim()) {
         // allow entry being just baseURL string?
         if (typeof val === "string") {
-          out[key] = { id: key, baseURL: val, npm: defaults?.npm, timeoutMs: defaults?.timeoutMs, modelDefaults: defaults?.modelDefaults }
+          out[key] = applyDefaults({ id: key, baseURL: val } as ProviderEntry)
           continue
         }
         continue
       }
-      out[key] = {
+      out[key] = applyDefaults({
         id: key,
         name: entry.name,
-        npm: entry.npm ?? defaults?.npm,
+        npm: entry.npm ?? entry.package,
+        package: entry.package ?? entry.npm,
         baseURL: entry.baseURL,
         apiKey: entry.apiKey,
         apiKeyEnv: entry.apiKeyEnv,
-        timeoutMs: entry.timeoutMs ?? defaults?.timeoutMs,
+        timeoutMs: entry.timeoutMs,
         enabled: entry.enabled,
-        modelDefaults: entry.modelDefaults ?? defaults?.modelDefaults,
+        modelDefaults: entry.modelDefaults,
         include: entry.include,
         exclude: entry.exclude,
         models: entry.models,
-      }
+        sendSessionHeaders: entry.sendSessionHeaders,
+        sessionHeader: entry.sessionHeader,
+      })
     }
   }
 
   // apply defaults where missing
   for (const [id, e] of Object.entries(out)) {
-    if (!e.npm && defaults?.npm) e.npm = defaults.npm
+    const npm = e.npm ?? e.package ?? defaults?.npm ?? defaults?.package
+    if (npm) {
+      e.npm = npm
+      e.package = npm
+    }
     if (!e.timeoutMs && defaults?.timeoutMs) e.timeoutMs = defaults.timeoutMs
     if (!e.modelDefaults && defaults?.modelDefaults) e.modelDefaults = defaults.modelDefaults
     if (!e.id) e.id = id
@@ -296,22 +329,49 @@ function normalizeProviders(
   return out
 }
 
+type LogFn = (level: "debug" | "info" | "warn" | "error", msg: string, extra?: any) => void
+
+function consoleLog(level: "debug" | "info" | "warn" | "error", msg: string, extra?: any): void {
+  const prefix = `[${SERVICE}]`
+  if (extra !== undefined) {
+    if (level === "error") console.error(prefix, msg, extra)
+    else if (level === "warn") console.warn(prefix, msg, extra)
+    else if (level === "debug") console.debug(prefix, msg, extra)
+    else console.log(prefix, msg, extra)
+  } else {
+    if (level === "error") console.error(prefix, msg)
+    else if (level === "warn") console.warn(prefix, msg)
+    else if (level === "debug") console.debug(prefix, msg)
+    else console.log(prefix, msg)
+  }
+}
+
 async function loadCustomConfig(
-  directory: string,
+  directories: string[],
   env: Record<string, string | undefined>,
-  log: (level: "debug" | "info" | "warn" | "error", msg: string, extra?: any) => Promise<void>,
+  log: LogFn,
 ): Promise<{ config: Record<string, ProviderEntry>; path: string | undefined; raw: CustomConfigFile | undefined }> {
-  const candidates = [
-    path.join(directory, ".opencode", "esuyo-opencode-custom-provider.json"),
-    path.join(directory, ".opencode", "esuyo-opencode-custom-provider.jsonc"),
-    path.join(directory, ".opencode", "opencode-custom-provider.json"),
-    path.join(directory, ".opencode", "opencode-custom-provider.jsonc"),
-    path.join(directory, ".opencode", "custom-providers.json"),
-    path.join(directory, ".opencode", "custom-providers.jsonc"),
-    path.join(directory, "esuyo-opencode-custom-provider.json"),
-    path.join(directory, "opencode-custom-provider.json"),
-    path.join(directory, "opencode-custom-provider.jsonc"),
+  const candidates: string[] = []
+
+  // env override (highest priority)
+  const envPath = env["OPENCODE_CUSTOM_PROVIDER_CONFIG"] ?? process.env["OPENCODE_CUSTOM_PROVIDER_CONFIG"]
+  if (envPath) candidates.push(envPath)
+
+  const projectFiles = [
+    ".opencode/esuyo-opencode-custom-provider.json",
+    ".opencode/esuyo-opencode-custom-provider.jsonc",
+    ".opencode/opencode-custom-provider.json",
+    ".opencode/opencode-custom-provider.jsonc",
+    ".opencode/custom-providers.json",
+    ".opencode/custom-providers.jsonc",
+    "esuyo-opencode-custom-provider.json",
+    "opencode-custom-provider.json",
+    "opencode-custom-provider.jsonc",
   ]
+  for (const dir of directories) {
+    if (!dir) continue
+    for (const rel of projectFiles) candidates.push(path.join(dir, rel))
+  }
 
   // global fallback: ~/.config/opencode/esuyo-opencode-custom-provider.json (and variants)
   // checked after project-level files so project overrides global
@@ -342,10 +402,6 @@ async function loadCustomConfig(
     }
   } catch {}
 
-  // env override (highest priority)
-  const envPath = env["OPENCODE_CUSTOM_PROVIDER_CONFIG"] ?? process.env["OPENCODE_CUSTOM_PROVIDER_CONFIG"]
-  if (envPath) candidates.unshift(envPath)
-
   for (const p of candidates) {
     try {
       const text = await fs.readFile(p, "utf8")
@@ -355,71 +411,151 @@ async function loadCustomConfig(
       } catch {
         json = JSON.parse(stripJsonComments(text))
       }
-      await log("info", `Loaded custom provider config`, { path: p, providers: Object.keys((json as any).providers ?? json).length })
+      log("info", `Loaded custom provider config`, { path: p })
       const defaults = (json as any).defaults
       const providers = normalizeProviders(json, defaults)
       if (Object.keys(providers).length === 0) {
-        await log("warn", `Custom provider config at ${p} has no providers`, { path: p })
+        log("warn", `Custom provider config at ${p} has no providers`, { path: p })
       }
       return { config: providers, path: p, raw: json }
     } catch (err: any) {
       if (err?.code !== "ENOENT") {
-        await log("warn", `Failed to read custom provider config at ${p}: ${err?.message}`, { path: p })
+        log("warn", `Failed to read custom provider config at ${p}: ${err?.message}`, { path: p })
       }
     }
   }
 
-  await log("info", `No custom provider config found, checked ${candidates.join(", ")} - will fallback to opencode.json providers if any have baseURL`)
+  log("info", `No custom provider config found - will fallback to existing providers with baseURL if any`)
   return { config: {}, path: undefined, raw: undefined }
 }
 
-function buildModelConfig(
-  id: string,
-  existing: Record<string, any> | undefined,
-  raw: Record<string, any> | undefined,
+// ---------------------------------------------------------------------------
+// V2 model building: V1 `{ name, modalities, attachment, limit }` becomes
+// V2 `Model.Info` `{ name, capabilities, limit }`.
+// ---------------------------------------------------------------------------
+
+function applyModelDefaultsToInfo(
+  info: Record<string, any>,
   defaults: ModelDefaults | undefined,
-) {
-  const defaultModalities = defaults?.modalities ?? DEFAULT_MODALITIES
-  const defaultLimit = defaults?.limit ?? DEFAULT_MODEL_LIMIT
-  const defaultAttachment = defaults?.attachment ?? true
+): void {
+  if (!defaults) return
+  info.capabilities = info.capabilities ?? { tools: true, input: ["text", "image"], output: ["text"] }
+  if (defaults.modalities) {
+    if (Array.isArray(defaults.modalities.input)) info.capabilities.input = [...defaults.modalities.input]
+    if (Array.isArray(defaults.modalities.output)) info.capabilities.output = [...defaults.modalities.output]
+  }
+  if (typeof defaults.attachment === "boolean") info.capabilities.tools = defaults.attachment
+  if (defaults.limit) {
+    info.limit = info.limit ?? {}
+    if (typeof defaults.limit.context === "number" && defaults.limit.context > 0)
+      info.limit.context = defaults.limit.context
+    if (typeof defaults.limit.output === "number" && defaults.limit.output > 0)
+      info.limit.output = defaults.limit.output
+    if (typeof defaults.limit.input === "number" && defaults.limit.input > 0)
+      info.limit.input = defaults.limit.input
+  }
+}
 
-  if (existing) {
-    const merged: Record<string, any> = { ...existing }
-    if (raw) {
-      const ctx = raw.context_length ?? raw.contextLength ?? raw.max_context ?? raw.limit?.context
-      if (typeof ctx === "number" && ctx > 0) merged.limit = { ...(merged.limit ?? {}), context: ctx }
-      const out = raw.max_output_tokens ?? raw.maxOutputTokens ?? raw.limit?.output ?? raw.output_length
-      if (typeof out === "number" && out > 0) merged.limit = { ...(merged.limit ?? {}), output: out }
-      if (typeof raw.supports_vision === "boolean" || typeof raw.supportsImage === "boolean") {
-        const vision = raw.supports_vision ?? raw.supportsImage
-        merged.modalities = merged.modalities ?? { input: ["text"], output: ["text"] }
-        const input = new Set<string>(merged.modalities.input ?? ["text"])
-        if (vision) input.add("image")
-        merged.modalities.input = Array.from(input)
-      }
+function applyStaticOverrideToInfo(info: Record<string, any>, override: Record<string, any>): void {
+  if (!override || typeof override !== "object") return
+  if (typeof override.name === "string" && override.name.trim()) info.name = override.name.trim()
+  if (typeof override.modelID === "string" && override.modelID.trim()) info.modelID = override.modelID.trim()
+  // V1 static shape: { name, limit, modalities, attachment }
+  const limit = override.limit
+  if (limit && typeof limit === "object") {
+    info.limit = info.limit ?? {}
+    if (typeof limit.context === "number" && limit.context > 0) info.limit.context = limit.context
+    if (typeof limit.output === "number" && limit.output > 0) info.limit.output = limit.output
+    if (typeof limit.input === "number" && limit.input > 0) info.limit.input = limit.input
+  }
+  const modalities = override.modalities ?? override.capabilities
+  if (modalities && typeof modalities === "object") {
+    info.capabilities = info.capabilities ?? { tools: true, input: ["text"], output: ["text"] }
+    if (Array.isArray((modalities as any).input)) info.capabilities.input = [...(modalities as any).input]
+    if (Array.isArray((modalities as any).output)) info.capabilities.output = [...(modalities as any).output]
+    if (typeof (modalities as any).tools === "boolean") info.capabilities.tools = (modalities as any).tools
+  }
+  if (typeof override.attachment === "boolean") {
+    info.capabilities = info.capabilities ?? { tools: true, input: ["text"], output: ["text"] }
+    info.capabilities.tools = override.attachment
+  }
+  if (typeof override.tools === "boolean") {
+    info.capabilities = info.capabilities ?? { tools: true, input: ["text"], output: ["text"] }
+    info.capabilities.tools = override.tools
+  }
+  // V2 passthrough fields
+  for (const key of ["capabilities", "headers", "body", "settings", "cost", "status", "enabled", "family", "compatibility"]) {
+    if (override[key] !== undefined) info[key] = override[key]
+  }
+}
+
+function buildModelInfo(
+  providerID: string,
+  id: string,
+  raw: Record<string, any> | undefined,
+  staticOverride: Record<string, any> | undefined,
+  defaults: ModelDefaults | undefined,
+): Record<string, any> {
+  // Model.Info.default(providerID, modelID) provides V2 defaults
+  // (capabilities.tools=true, input [text,image], limit 200k/32k).
+  let base: Record<string, any>
+  try {
+    const pid: any = (Provider as any).ID ? (Provider as any).ID.make(providerID) : providerID
+    const mid: any = (Model as any).ID ? (Model as any).ID.make(id) : id
+    base = { ...(Model as any).Info.default(pid, mid) }
+  } catch {
+    base = {
+      id,
+      modelID: id,
+      providerID,
+      name: humanizeModelId(id),
+      capabilities: { tools: true, input: ["text", "image"], output: ["text"] },
+      limit: { ...DEFAULT_MODEL_LIMIT },
+      enabled: true,
+      status: "active",
     }
-    return merged
   }
 
-  const name = humanizeModelId(id)
-  const cfg: Record<string, any> = {
-    name,
-    modalities: { ...defaultModalities, input: [...(defaultModalities.input as any)], output: [...(defaultModalities.output as any)] },
-    attachment: defaultAttachment,
-    limit: { ...defaultLimit },
-  }
+  // Ensure plain-string IDs survive Effect branding at runtime.
+  base.id = id
+  base.modelID = base.modelID ?? id
+  base.providerID = providerID
+  if (!base.name || base.name === id) base.name = humanizeModelId(id)
 
+  // Gateway-advertised metadata refines the defaults.
   if (raw) {
-    if (typeof raw.display_name === "string" && raw.display_name.trim()) cfg.name = raw.display_name.trim()
-    else if (typeof raw.name === "string" && raw.name.trim() && raw.name !== id) cfg.name = raw.name.trim()
-    const ctx = raw.context_length ?? raw.contextLength ?? raw.limit?.context ?? raw.max_context
-    if (typeof ctx === "number" && ctx > 0) cfg.limit.context = ctx
-    const out = raw.max_output_tokens ?? raw.maxOutputTokens ?? raw.limit?.output ?? raw.max_tokens
-    if (typeof out === "number" && out > 0) cfg.limit.output = out
+    if (typeof raw.display_name === "string" && raw.display_name.trim()) base.name = raw.display_name.trim()
+    else if (typeof raw.name === "string" && raw.name.trim() && raw.name !== id) base.name = raw.name.trim()
+    else base.name = humanizeModelId(id)
+    const ctxVal = raw.context_length ?? raw.contextLength ?? raw.limit?.context ?? raw.max_context
+    if (typeof ctxVal === "number" && ctxVal > 0) {
+      base.limit = base.limit ?? {}
+      base.limit.context = ctxVal
+    }
+    const outVal = raw.max_output_tokens ?? raw.maxOutputTokens ?? raw.limit?.output ?? raw.max_tokens
+    if (typeof outVal === "number" && outVal > 0) {
+      base.limit = base.limit ?? {}
+      base.limit.output = outVal
+    }
+    if (typeof raw.supports_vision === "boolean" || typeof raw.supportsImage === "boolean") {
+      const vision = raw.supports_vision ?? raw.supportsImage
+      base.capabilities = base.capabilities ?? { tools: true, input: ["text"], output: ["text"] }
+      const input = new Set<string>(base.capabilities.input ?? ["text"])
+      if (vision) input.add("image")
+      else input.delete("image")
+      base.capabilities.input = Array.from(input)
+    }
   }
 
-  // apply defaults override for known tiny models if defaults not specific
-  return cfg
+  applyModelDefaultsToInfo(base, defaults)
+  if (staticOverride) applyStaticOverrideToInfo(base, staticOverride)
+
+  // Keep capabilities/limit shapes the V2 registry expects.
+  base.capabilities = base.capabilities ?? { tools: true, input: [...DEFAULT_MODALITIES.input], output: [...DEFAULT_MODALITIES.output] }
+  base.limit = base.limit ?? { ...DEFAULT_MODEL_LIMIT }
+  if (typeof base.enabled !== "boolean") base.enabled = true
+
+  return base
 }
 
 async function fetchGatewayModels(
@@ -489,285 +625,323 @@ function filterModels(
   return out
 }
 
-export const OpencodeCustomProviderPlugin: Plugin = async ({ client, directory }) => {
-  const log = async (level: "debug" | "info" | "warn" | "error", message: string, extra?: Record<string, any>) => {
-    try {
-      await client.app.log({ body: { service: SERVICE, level, message, extra: { directory, ...extra } } })
-    } catch {}
-  }
+// ---------------------------------------------------------------------------
+// V2 plugin definition. The default export MUST be `{ id, setup }` — the V2
+// server rejects the V1 function shape with:
+// "Plugin must export a default definition with an id and an effect or setup
+// function."
+// ---------------------------------------------------------------------------
 
-  // per-baseURL cache
-  const cache = new Map<string, { models: RawGatewayModel[]; at: number }>()
+export default Plugin.define({
+  id: PLUGIN_ID,
+  async setup(ctx) {
+    const log: LogFn = (level, msg, extra) => consoleLog(level, msg, extra)
 
-  async function getDiscoveredModels(baseURL: string, apiKey: string | undefined, timeoutMs: number): Promise<RawGatewayModel[]> {
-    const now = Date.now()
-    const hit = cache.get(baseURL)
-    if (hit && now - hit.at < 30_000) return hit.models
-    const models = await fetchGatewayModels(baseURL, apiKey, timeoutMs)
-    cache.set(baseURL, { models, at: now })
-    return models
-  }
+    const rawDirs = [
+      (ctx.location as any)?.project?.directory,
+      (ctx.location as any)?.project?.canonical,
+      (ctx.location as any)?.directory,
+    ].filter((d) => typeof d === "string" && d.length > 0) as string[]
+    const directories = [...new Set(rawDirs)]
+    const displayDir = directories[0] ?? process.cwd()
 
-  // ---------------------------------------------------------------------------
-  // x-opencode-session injection state (OpenCode Go/Zen compliance)
-  // Opencode core only sends x-opencode-session for providerIDs starting with
-  // "opencode"; custom gateways get x-session-affinity/X-Session-Id instead.
-  // The chat.headers hook below backfills x-opencode-session with the current
-  // opencode sessionID so gateways proxying to Go stay compliant after 09/06.
-  // Populated by the config hook; read by the chat.headers hook.
-  // ---------------------------------------------------------------------------
-  const managedProviderIds = new Set<string>()
-  let sessionHeadersEnabled = true
-  let sessionHeaderName = DEFAULT_SESSION_HEADER
-  let sessionHeaderAllowlist: Set<string> | null = null
-  const perProviderSessionOpts = new Map<string, { enabled: boolean; header?: string }>()
+    // per-baseURL discovery cache (30s, same as V1)
+    const cache = new Map<string, { models: RawGatewayModel[]; at: number }>()
 
-  function applySessionHeadersConfig(raw: CustomConfigFile | undefined): void {
-    const cfg = raw?.sessionHeaders
-    sessionHeadersEnabled = true
-    sessionHeaderName = DEFAULT_SESSION_HEADER
-    sessionHeaderAllowlist = null
-    if (cfg === false) {
-      sessionHeadersEnabled = false
-      return
+    async function getDiscoveredModels(baseURL: string, apiKey: string | undefined, timeoutMs: number): Promise<RawGatewayModel[]> {
+      const now = Date.now()
+      const hit = cache.get(baseURL)
+      if (hit && now - hit.at < 30_000) return hit.models
+      const models = await fetchGatewayModels(baseURL, apiKey, timeoutMs)
+      cache.set(baseURL, { models, at: now })
+      return models
     }
-    if (cfg === true || cfg === undefined) return
-    if (typeof cfg === "object" && cfg !== null) {
-      if ((cfg as SessionHeadersConfig).enabled === false) {
+
+    // -----------------------------------------------------------------------
+    // x-opencode-session injection state (OpenCode Go/Zen compliance)
+    // -----------------------------------------------------------------------
+    const managedProviderIds = new Set<string>()
+    let sessionHeadersEnabled = true
+    let sessionHeaderName = DEFAULT_SESSION_HEADER
+    let sessionHeaderAllowlist: Set<string> | null = null
+    const perProviderSessionOpts = new Map<string, { enabled: boolean; header?: string }>()
+
+    function applySessionHeadersConfig(raw: CustomConfigFile | undefined): void {
+      const cfg = raw?.sessionHeaders
+      sessionHeadersEnabled = true
+      sessionHeaderName = DEFAULT_SESSION_HEADER
+      sessionHeaderAllowlist = null
+      if (cfg === false) {
         sessionHeadersEnabled = false
         return
       }
-      const header = (cfg as SessionHeadersConfig).header
-      if (typeof header === "string" && header.trim()) sessionHeaderName = header.trim()
-      const providers = (cfg as SessionHeadersConfig).providers
-      if (Array.isArray(providers) && providers.length > 0) {
-        sessionHeaderAllowlist = new Set(providers.filter((p) => typeof p === "string" && p.trim()).map((p) => p.trim()))
+      if (cfg === true || cfg === undefined) return
+      if (typeof cfg === "object" && cfg !== null) {
+        if ((cfg as SessionHeadersConfig).enabled === false) {
+          sessionHeadersEnabled = false
+          return
+        }
+        const header = (cfg as SessionHeadersConfig).header
+        if (typeof header === "string" && header.trim()) sessionHeaderName = header.trim()
+        const providers = (cfg as SessionHeadersConfig).providers
+        if (Array.isArray(providers) && providers.length > 0) {
+          sessionHeaderAllowlist = new Set(providers.filter((p) => typeof p === "string" && p.trim()).map((p) => p.trim()))
+        }
       }
     }
-  }
 
-  return {
-    config: async (config) => {
-      try {
-        await log("info", "Opencode Custom Provider startup - loading custom config")
-        if (!config.provider) config.provider = {}
+    try {
+      log("info", `Opencode Custom Provider (V2) startup - loading custom config`, { directory: displayDir })
+      const env: Record<string, string | undefined> = (typeof process !== "undefined" ? (process.env as any) : {}) as any
 
-        const env: Record<string, string | undefined> = (typeof process !== "undefined" ? (process.env as any) : {}) as any
+      const { config: providersFromFile, path: configPath, raw: rawJson } = await loadCustomConfig(directories, env, log)
+      applySessionHeadersConfig(rawJson)
 
-        const { config: providers, path: configPath, raw: rawJson } = await loadCustomConfig(directory, env, log)
-        applySessionHeadersConfig(rawJson)
-
-        // Fallback: if no custom config, sync providers already in opencode.json that have baseURL and no explicit models or dynamic flag
-        // This keeps backward compat with existing esuyo-gateway hard-coded in opencode.json
-        let providerEntries: Record<string, ProviderEntry> = providers
-        if (Object.keys(providerEntries).length === 0) {
-          await log("info", "No custom providers - checking opencode.json providers with baseURL for backward compat")
-          for (const [id, p] of Object.entries((config.provider as any) ?? {})) {
-            const opts = (p as any)?.options
-            if (opts?.baseURL && typeof opts.baseURL === "string") {
+      // Fallback: if no custom config, sync existing providers that already
+      // expose a baseURL in settings (keeps backward compat with providers
+      // hard-coded in opencode.jsonc). V2 providers live in the provider
+      // registry — not in a mutable `config.provider` object.
+      let providerEntries: Record<string, ProviderEntry> = providersFromFile
+      if (Object.keys(providerEntries).length === 0) {
+        log("info", "No custom providers - checking existing providers with baseURL for backward compat")
+        try {
+          const listResult: any = await (ctx.provider as any).list()
+          const arr: any[] = Array.isArray(listResult) ? listResult : (listResult?.data ?? [])
+          for (const item of arr) {
+            const info = item?.provider ?? item
+            const id = info?.id
+            const baseURL = info?.settings?.baseURL
+            if (typeof id === "string" && id && typeof baseURL === "string" && baseURL.trim()) {
               providerEntries[id] = {
                 id,
-                name: (p as any).name,
-                npm: (p as any).npm,
-                baseURL: opts.baseURL,
-                apiKey: opts.apiKey,
+                name: info?.name,
+                npm: info?.package,
+                package: info?.package,
+                baseURL: baseURL.trim(),
+                apiKey: typeof info?.settings?.apiKey === "string" ? info.settings.apiKey : undefined,
                 enabled: true,
               }
             }
           }
           if (Object.keys(providerEntries).length > 0) {
-            await log("info", `Fallback discovered ${Object.keys(providerEntries).length} providers from opencode.json`, { providers: Object.keys(providerEntries) })
+            log("info", `Fallback discovered ${Object.keys(providerEntries).length} providers from registry`, {
+              providers: Object.keys(providerEntries),
+            })
           } else {
-            await log("warn", "No providers to sync - create .opencode/opencode-custom-provider.json")
-            return
+            log("warn", "No providers to sync - create .opencode/esuyo-opencode-custom-provider.json")
           }
+        } catch (err: any) {
+          log("warn", `Provider fallback list failed: ${err?.message ?? String(err)}`)
         }
-
-        const disabled: string[] = (config as any).disabled_providers ?? []
-        const enabledAllow: string[] | null = (config as any).enabled_providers ? [...(config as any).enabled_providers] : null
-
-        // Seed per-provider session-header opts (config hook runs before any
-        // chat.headers call, so the headers hook can rely on this map).
-        // Seed the managed set here too (not only after a successful fetch)
-        // so injection still works when the gateway is unreachable and the
-        // plugin keeps existing models.
-        perProviderSessionOpts.clear()
-        managedProviderIds.clear()
-        for (const [pid, pentry] of Object.entries(providerEntries)) {
-          perProviderSessionOpts.set(pid, {
-            enabled: (pentry as ProviderEntry).sendSessionHeaders !== false,
-            header: typeof (pentry as ProviderEntry).sessionHeader === "string" && (pentry as ProviderEntry).sessionHeader!.trim()
-              ? (pentry as ProviderEntry).sessionHeader!.trim()
-              : undefined,
+        if (Object.keys(providerEntries).length === 0) {
+          // Still register the session hook so headers work for manually
+          // configured providers, then exit early.
+          await ctx.session.hook("model.request", (event: any) => {
+            try {
+              if (!sessionHeadersEnabled) return
+              const sessionID = event?.sessionID
+              if (typeof sessionID !== "string" || !sessionID) return
+              const providerID = event?.model?.providerID
+              if (typeof providerID !== "string" || !providerID) return
+              if (providerID.startsWith("opencode")) return
+              if (sessionHeaderAllowlist && !sessionHeaderAllowlist.has(providerID)) return
+              if (!sessionHeaderAllowlist && !managedProviderIds.has(providerID)) return
+              const perProvider = perProviderSessionOpts.get(providerID)
+              if (perProvider && perProvider.enabled === false) return
+              const headerName = perProvider?.header || sessionHeaderName || DEFAULT_SESSION_HEADER
+              event.headers[headerName] = sessionID
+            } catch {}
           })
-          managedProviderIds.add(pid)
+          return
+        }
+      }
+
+      // Seed per-provider session-header opts before any hook can run.
+      perProviderSessionOpts.clear()
+      managedProviderIds.clear()
+      for (const [pid, pentry] of Object.entries(providerEntries)) {
+        perProviderSessionOpts.set(pid, {
+          enabled: (pentry as ProviderEntry).sendSessionHeaders !== false,
+          header: typeof (pentry as ProviderEntry).sessionHeader === "string" && (pentry as ProviderEntry).sessionHeader!.trim()
+            ? (pentry as ProviderEntry).sessionHeader!.trim()
+            : undefined,
+        })
+        managedProviderIds.add(pid)
+      }
+
+      // Gateway discovery is network I/O and must NOT block setup:
+      // locations fail to activate if a plugin's setup is slow
+      // ("Location plugins did not finish activating"). Register the
+      // transform + hook immediately, sync in the background, then reload.
+      type SyncedProvider = { info: Record<string, any>; models: Record<string, any>[] }
+      const source: { providers: SyncedProvider[] } = { providers: [] }
+
+      const syncOne = async ([providerId, entry]: [string, ProviderEntry]): Promise<void> => {
+        const enabled = entry.enabled !== false
+        if (!enabled) {
+          log("info", `Provider ${providerId} disabled via custom config, skipping`, { providerId, configPath })
+          return
         }
 
-        // Prepare sync tasks in parallel
-        const tasks = Object.entries(providerEntries).map(async ([providerId, entry]) => {
-          const enabled = entry.enabled !== false
-          if (!enabled) {
-            await log("info", `Provider ${providerId} disabled via custom config, skipping`, { providerId, configPath })
-            return
-          }
-          if (disabled.includes(providerId)) {
-            await log("info", `Provider ${providerId} in disabled_providers, skipping`, { providerId })
-            return
-          }
-          if (enabledAllow && !enabledAllow.includes(providerId)) {
-            await log("info", `Provider ${providerId} not in enabled_providers, skipping`, { providerId })
-            return
-          }
+        const rawPackage = entry.package ?? entry.npm
+        const pkg = toV2Package(rawPackage)
+        const name = entry.name ?? providerId
+        const baseURL = entry.baseURL
+        const timeoutMs = entry.timeoutMs ?? DEFAULT_TIMEOUT_MS
 
-          // Ensure provider entry exists in opencode config
-          let provider: any = (config.provider as any)[providerId]
-          const npm = entry.npm ?? DEFAULT_NPM
-          const name = entry.name ?? provider?.name ?? providerId
-          const baseURL = entry.baseURL
-          const timeoutMs = entry.timeoutMs ?? DEFAULT_TIMEOUT_MS
-
-          if (!provider) {
-            await log("info", `Provider ${providerId} not in opencode.json - auto-creating`, { providerId, baseURL, configPath })
-            provider = { npm, name, options: { baseURL } }
-            ;(config.provider as any)[providerId] = provider
-          } else {
-            if (!provider.npm) provider.npm = npm
-            if (!provider.name) provider.name = name
-            if (!provider.options) provider.options = {}
-            if (!provider.options.baseURL) provider.options.baseURL = baseURL
-            // if custom config specifies baseURL different from opencode.json, prefer custom config but log
-            if (entry.baseURL && provider.options.baseURL !== entry.baseURL) {
-              await log("info", `Provider ${providerId} baseURL overridden by custom config`, { providerId, from: provider.options.baseURL, to: entry.baseURL })
-              provider.options.baseURL = entry.baseURL
-            }
-          }
-
-          let apiKey = await resolveApiKeyAsync(entry, provider.options, env)
-          if (!apiKey) {
-            // Fallback: reuse apiKey from any other provider with same baseURL (e.g. multiple gateways sharing same backend)
-            for (const [otherId, otherProv] of Object.entries((config.provider as any) ?? {})) {
-              if (otherId === providerId) continue
-              const otherOpts = (otherProv as any)?.options
-              if (otherOpts?.baseURL === baseURL && typeof otherOpts?.apiKey === "string" && otherOpts.apiKey.trim() && otherOpts.apiKey.trim() !== "none") {
-                const v = (await resolveStringValueAsync(otherOpts.apiKey as string, env)) ?? resolveStringValue(otherOpts.apiKey as string, env)
-                if (v) {
-                  apiKey = v
-                  await log("info", `Using fallback apiKey from ${otherId} for ${providerId} (same baseURL)`, { providerId, fallback: otherId })
-                  break
-                }
+        let apiKey = await resolveApiKeyAsync(entry, undefined, env)
+        if (!apiKey) {
+          // Reuse apiKey from another entry with the same baseURL.
+          for (const [otherId, otherEntry] of Object.entries(providerEntries)) {
+            if (otherId === providerId) continue
+            if (otherEntry.baseURL === baseURL && typeof otherEntry.apiKey === "string" && otherEntry.apiKey.trim() && otherEntry.apiKey.trim() !== "none") {
+              const v = (await resolveStringValueAsync(otherEntry.apiKey, env)) ?? resolveStringValue(otherEntry.apiKey, env)
+              if (v) {
+                apiKey = v
+                log("info", `Using fallback apiKey from ${otherId} for ${providerId} (same baseURL)`, { providerId, fallback: otherId })
+                break
               }
             }
           }
-          if (!apiKey) {
-            await log("warn", `No apiKey for ${providerId} - attempting unauthenticated`, { providerId, baseURL, hint: `Set apiKey or apiKeyEnv in custom config or ${providerId.toUpperCase()}_API_KEY env` })
-          } else {
-            await log("debug", `Using apiKey for ${providerId}`, { providerId, baseURL, hasKey: true })
-            // Persist apiKey for LLM requests - provider chat needs options.apiKey
-            if (provider.options) provider.options.apiKey = apiKey
-          }
+        }
+        if (!apiKey) {
+          log("warn", `No apiKey for ${providerId} - attempting unauthenticated`, {
+            providerId,
+            baseURL,
+            hint: `Set apiKey or apiKeyEnv in custom config or ${providerId.toUpperCase()}_API_KEY env`,
+          })
+        }
 
-          const existingModels: Record<string, any> = provider.models ?? {}
-          const existingCount = Object.keys(existingModels).length
-          const modelsUrl = resolveModelsUrl(baseURL)
-          await log("info", `Fetching models for ${providerId}`, { providerId, baseURL: modelsUrl, existingCount, timeoutMs })
+        const modelsUrl = resolveModelsUrl(baseURL)
+        log("info", `Fetching models for ${providerId}`, { providerId, baseURL: modelsUrl, timeoutMs })
 
-          let discovered: RawGatewayModel[]
-          try {
-            discovered = await getDiscoveredModels(baseURL, apiKey, timeoutMs)
-          } catch (err: any) {
-            const msg = err?.message ?? String(err)
-            await log("warn", `Gateway fetch failed for ${providerId}, keeping ${existingCount} existing`, { providerId, baseURL, error: msg })
-            if (existingCount === 0) await log("error", `No models and gateway unreachable for ${providerId}`, { providerId, error: msg })
-            return
-          }
+        let discovered: RawGatewayModel[]
+        try {
+          discovered = await getDiscoveredModels(baseURL, apiKey, timeoutMs)
+        } catch (err: any) {
+          const msg = err?.message ?? String(err)
+          log("warn", `Gateway fetch failed for ${providerId}, skipping sync`, { providerId, baseURL, error: msg })
+          return
+        }
 
-          // apply include/exclude filtering
-          const filtered = filterModels(discovered, entry.include, entry.exclude)
-          if (filtered.length !== discovered.length) {
-            await log("info", `Filtered ${providerId}: ${discovered.length} -> ${filtered.length}`, { providerId, include: entry.include, exclude: entry.exclude })
-          }
-          discovered = filtered
+        const filtered = filterModels(discovered, entry.include, entry.exclude)
+        if (filtered.length !== discovered.length) {
+          log("info", `Filtered ${providerId}: ${discovered.length} -> ${filtered.length}`, {
+            providerId,
+            include: entry.include,
+            exclude: entry.exclude,
+          })
+        }
+        discovered = filtered
 
-          if (discovered.length === 0) {
-            await log("warn", `Gateway returned 0 models for ${providerId}, keeping existing`, { providerId, existingCount })
-            return
-          }
+        if (discovered.length === 0) {
+          log("warn", `Gateway returned 0 models for ${providerId}, skipping sync`, { providerId })
+          return
+        }
 
-          await log("info", `Discovered ${discovered.length} models for ${providerId}`, { providerId, sample: discovered.slice(0, 3).map((m) => m.id) })
-
-          const nextModels: Record<string, any> = {}
-          let added = 0
-          let reused = 0
-          for (const { id, raw } of discovered) {
-            const existing = existingModels[id]
-            // also consider static models override from custom config entry.models[id]
-            const staticOverride = entry.models?.[id]
-            const mergedExisting = staticOverride ? { ...(existing ?? {}), ...staticOverride } : existing
-            const cfg = buildModelConfig(id, mergedExisting, raw, entry.modelDefaults)
-            nextModels[id] = cfg
-            if (existing || staticOverride) reused++
-            else added++
-          }
-
-          // also preserve static models that are not in discovered but explicitly defined in entry.models?
-          // Optionally keep them - we merge them in addition
-          if (entry.models) {
-            for (const [mid, mcfg] of Object.entries(entry.models)) {
-              if (!(mid in nextModels)) {
-                nextModels[mid] = mcfg
-                await log("info", `Keeping static model ${mid} for ${providerId} not in gateway`, { providerId, modelId: mid })
-              }
-            }
-          }
-
-          const removed = Object.keys(existingModels).filter((id) => !(id in nextModels))
-          if (removed.length > 0) await log("info", `Removing ${removed.length} stale models for ${providerId}`, { providerId, removed })
-
-          provider.models = nextModels
-          managedProviderIds.add(providerId)
-          await log("info", `Provider ${providerId} models synced`, { providerId, total: discovered.length, added, reused, removed: removed.length })
+        log("info", `Discovered ${discovered.length} models for ${providerId}`, {
+          providerId,
+          sample: discovered.slice(0, 3).map((m) => m.id),
         })
 
-        await Promise.allSettled(tasks)
-        await log("info", "Opencode Custom Provider sync complete", { providers: Object.keys(providerEntries) })
-      } catch (err: any) {
-        await log("error", `Unexpected error: ${err?.message ?? String(err)}`, { error: String(err?.stack ?? err) })
+        const models: Record<string, any>[] = []
+        for (const { id, raw } of discovered) {
+          const staticOverride = entry.models?.[id]
+          models.push(buildModelInfo(providerId, id, raw, staticOverride, entry.modelDefaults))
+        }
+
+        // Preserve explicitly configured static models absent from the gateway.
+        if (entry.models) {
+          const seen = new Set(models.map((m) => m.id))
+          for (const [mid, mcfg] of Object.entries(entry.models)) {
+            if (!seen.has(mid)) {
+              models.push(buildModelInfo(providerId, mid, undefined, mcfg, entry.modelDefaults))
+              log("info", `Keeping static model ${mid} for ${providerId} not in gateway`, { providerId, modelId: mid })
+            }
+          }
+        }
+
+        // Build the V2 provider info. settings carries the runtime options
+        // (baseURL + apiKey) for `@opencode/ai/providers/openai-compatible`.
+        let providerInfo: Record<string, any>
+        try {
+          const pid: any = (Provider as any).ID.make(providerId)
+          providerInfo = { ...(Provider as any).Info.empty(pid) }
+        } catch {
+          providerInfo = { id: providerId, name: providerId, activation: "auto", package: "" }
+        }
+        providerInfo.id = providerId
+        providerInfo.name = name
+        providerInfo.activation = "enabled"
+        providerInfo.package = pkg
+        providerInfo.settings = { ...(providerInfo.settings ?? {}), baseURL }
+        if (apiKey) providerInfo.settings.apiKey = apiKey
+
+        source.providers.push({ info: providerInfo, models })
+        log("info", `Provider ${providerId} models prepared`, { providerId, total: models.length })
       }
-    },
 
-    "chat.headers": async (input, output) => {
-      try {
-        if (!sessionHeadersEnabled) return
-        const sessionID = (input as { sessionID?: unknown }).sessionID
-        if (typeof sessionID !== "string" || !sessionID) return
-        const model = (input as { model?: { providerID?: unknown } }).model
-        const providerCtx = (input as { provider?: { info?: { id?: unknown } } }).provider
-        const providerID =
-          (typeof model?.providerID === "string" && model.providerID) ||
-          (typeof providerCtx?.info?.id === "string" && (providerCtx.info.id as string)) ||
-          ""
-        if (!providerID) return
-        // Opencode core already sends x-opencode-session for first-party
-        // opencode providers — setting it again to the same sessionID is a
-        // harmless no-op, so just skip them and only backfill custom gateways.
-        if (providerID.startsWith("opencode")) return
-        if (sessionHeaderAllowlist && !sessionHeaderAllowlist.has(providerID)) return
-        // Default scope: only providers managed by this plugin, so we never
-        // touch the user's unrelated providers (anthropic, openai, ...).
-        // An explicit sessionHeaders.providers allowlist opts in unmanaged IDs.
-        if (!sessionHeaderAllowlist && !managedProviderIds.has(providerID)) return
-        const perProvider = perProviderSessionOpts.get(providerID)
-        if (perProvider && perProvider.enabled === false) return
-        const headerName = perProvider?.header || sessionHeaderName || DEFAULT_SESSION_HEADER
-        output.headers[headerName] = sessionID
-      } catch {
-        // header injection must never break the request
+      const applySource = (editor: any) => {
+        for (const { info, models } of source.providers) {
+          const existing = editor.get(info.id)
+          if (existing) {
+            editor.update(info.id, (provider: any) => {
+              provider.name = info.name
+              provider.package = info.package
+              provider.activation = info.activation
+              provider.settings = { ...(provider.settings ?? {}), ...info.settings }
+            })
+            editor.models.set(info.id, models)
+          } else {
+            editor.add({ info, models })
+          }
+        }
       }
-    },
-  }
-}
 
-export default OpencodeCustomProviderPlugin
+      // Register first (fast, non-blocking): replays `source` on every reload.
+      await ctx.provider.transform(applySource)
 
+      // Session-header backfill (V1 `chat.headers` -> V2 `model.request`).
+      await ctx.session.hook("model.request", (event: any) => {
+        try {
+          if (!sessionHeadersEnabled) return
+          const sessionID = event?.sessionID
+          if (typeof sessionID !== "string" || !sessionID) return
+          const providerID = event?.model?.providerID
+          if (typeof providerID !== "string" || !providerID) return
+          // Core already sends x-opencode-session for first-party opencode providers.
+          if (providerID.startsWith("opencode")) return
+          if (sessionHeaderAllowlist && !sessionHeaderAllowlist.has(providerID)) return
+          // Default scope: only providers managed by this plugin.
+          if (!sessionHeaderAllowlist && !managedProviderIds.has(providerID)) return
+          const perProvider = perProviderSessionOpts.get(providerID)
+          if (perProvider && perProvider.enabled === false) return
+          const headerName = perProvider?.header || sessionHeaderName || DEFAULT_SESSION_HEADER
+          event.headers[headerName] = sessionID
+        } catch {
+          // header injection must never break the request
+        }
+      })
 
-
+      // Background sync: fetch gateway inventories, then reload the provider
+      // registry so the transform above replays with real data. Floating
+      // promise — never blocks setup, never throws (all errors are logged).
+      void (async () => {
+        try {
+          await Promise.allSettled(Object.entries(providerEntries).map(syncOne))
+          const synced = source.providers
+          if (synced.length === 0) {
+            log("warn", "Opencode Custom Provider sync produced no providers (all fetches failed or filtered out)")
+            return
+          }
+          await ctx.provider.reload()
+          log("info", "Opencode Custom Provider sync complete", { providers: synced.map((s) => s.info.id) })
+        } catch (err: any) {
+          log("error", `Background sync failed: ${err?.message ?? String(err)}`)
+        }
+      })()
+    } catch (err: any) {
+      log("error", `Unexpected error: ${err?.message ?? String(err)}`, { error: String(err?.stack ?? err) })
+    }
+  },
+})

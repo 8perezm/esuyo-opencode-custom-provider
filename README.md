@@ -25,7 +25,7 @@ Do this once and it works everywhere.
 Open your terminal (PowerShell on Windows, Terminal on Mac) and run:
 
 ```bash
-opencode plugin @esuyo/esuyo-opencode-custom-provider --global
+opencode plugin add @esuyo/esuyo-opencode-custom-provider
 ```
 
 That's it. Opencode will download it and remember it.
@@ -155,7 +155,7 @@ See the full example at [`examples/esuyo-opencode-custom-provider.example.json`]
 When we release a new version, run:
 
 ```bash
-opencode plugin @esuyo/esuyo-opencode-custom-provider --global --force
+opencode plugin update @esuyo/esuyo-opencode-custom-provider
 ```
 
 Or if that doesn’t work:
@@ -165,7 +165,13 @@ Remove-Item -Recurse -Force "$HOME\.cache\opencode\packages" -ErrorAction Silent
 opencode debug config
 ```
 
-That’s from the official docs: [opencode.ai/docs/plugins](https://opencode.ai/docs/plugins) and [opencode.ai/docs/cli#plugin](https://opencode.ai/docs/cli#plugin).
+That’s from the official docs: [opencode.ai/v2/docs/plugins](https://opencode.ai/v2/docs/plugins).
+
+> **Running a local build instead of npm** (e.g. while a release is being
+> repaired): build the repo and copy the output into the global discovery
+> directory, then `opencode reload` — see
+> [Development Guide → Testing locally](./docs/DEVELOPMENT.md#testing-locally).
+> Delete the copy (and re-install from npm) once the fixed release is out.
 
 ## 🆘 Help, it doesn’t work!
 

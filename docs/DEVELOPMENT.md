@@ -8,7 +8,7 @@ This is for **plugin developers** who want to change the code of `@esuyo/esuyo-o
 
 - Node.js `>=18` (`node --version`)
 - `npm` (`npm --version`) — the repo uses `npm ci`
-- Opencode `>=1.18.25` for testing
+- Opencode `>=2.0` for testing (V2-only since 0.4.0; V1 needs `<=0.3.x`)
 
 ## Setup
 
@@ -45,17 +45,22 @@ docs/                   # you are here
 
 ### Option A — local file plugin (fastest)
 
-Opencode loads local plugins from `~/.config/opencode/plugins/` and `.opencode/plugins/` directly (no npm cache).
+Opencode 2 auto-loads `~/.config/opencode/plugins/*.js` (and
+`.opencode/plugins/` per project) — no npm cache involved. The file must be
+the **built** output (`dist/index.js`), not TS source:
 
 ```bash
-# build first
 npm run build
-# copy or symlink src
 mkdir -p ~/.config/opencode/plugins
-cp src/index.ts ~/.config/opencode/plugins/esuyo-custom-provider.ts
-# edit, then re-run opencode
-opencode debug config
+cp dist/index.js ~/.config/opencode/plugins/esuyo-custom-provider.js
+opencode reload
+opencode models  # should list esuyo-gateway/...
 ```
+
+> Explicit `plugins: ["./local/path"]` entries in `opencode.json` are
+> silently ignored by Opencode 2.0.29 on Windows — use the `plugins/`
+> discovery directory instead. Re-copy after every build (the file is a
+> snapshot, not a link).
 
 ### Option B — npm link
 
@@ -84,24 +89,39 @@ Every `POST /chat/completions` line should show `x-opencode-session: ses_...`.
 `(MISSING)` means the hook isn't firing (plugin not loaded, provider not
 managed, or `sessionHeaders: false`). Ctrl+C prints a pass/fail summary.
 
-Logs are via `client.app.log({ service: "opencode-custom-provider" })` at `src/index.ts:464`.
+Logs go to stdout (`[opencode-custom-provider]` prefix) — visible in
+`opencode ... --standalone --print-logs`, **not** in the background service
+log. `src/index.ts` line numbers below are approximate.
 
 ## Code overview
 
-- `loadCustomConfig(directory, env, log)` — `src/index.ts:271` — searches in order:
-  `OPENCODE_CUSTOM_PROVIDER_CONFIG` env → project `.opencode/*` → `~/.config/opencode/*` (`$XDG_CONFIG_HOME`, `%APPDATA%`) → fallback to `opencode.json` providers with `baseURL`.
-- `normalizeProviders()` — handles both `providers: {id: {baseURL}}` map and array forms.
+- `loadCustomConfig(directories, env, log)` — searches in order:
+  `OPENCODE_CUSTOM_PROVIDER_CONFIG` env → project `.opencode/*` (for every
+  of `project.directory`, `project.canonical`, `location.directory`) →
+  `~/.config/opencode/*` (`$XDG_CONFIG_HOME`, `%APPDATA%`) → fallback to
+  registry providers with `settings.baseURL`.
+- `normalizeProviders()` — handles `providers: {id: {baseURL}}` map, array
+  `[{id, baseURL}]`, and bare-map forms.
 - `fetchGatewayModels()` — GET `${baseURL}/v1/models` (handles trailing slashes, `/v1`, `/models`), `Authorization: Bearer <apiKey>` + `x-api-key`, 8s timeout default.
 - `filterModels()` — regex `include`/`exclude`.
-- `buildModelConfig()` — humanizes IDs, merges `raw.context_length` etc. into `limit`/`modalities`.
-- `config` hook — `src/index.ts:484` — creates `config.provider[providerId]` if missing, resolves `apiKey` (supports `{env:VAR}`, `{file:~/path}`, `apiKeyEnv`, providerId env fallbacks), fetches models, syncs `provider.models`.
+- `buildModelInfo()` — builds V2 `Model.Info` via `Model.Info.default()`,
+  humanizes IDs, merges `raw.context_length` etc. into `limit`/`capabilities`.
+- `setup()` — V2 entrypoint (`Plugin.define({ id, setup })`):
+  1. reads the custom JSON (fast, local fs only),
+  2. registers `ctx.provider.transform` (replays a mutable `source` object) and the `model.request` session hook (fast — setup returns in ms),
+  3. syncs gateways in a **background** floating promise, then `ctx.provider.reload()`.
+  
+  Setup must never block on network: locations fail to activate otherwise
+  (`ServiceUnavailableError: Location plugins did not finish activating`).
+- Session hook — `ctx.session.hook("model.request", …)` backfills
+  `x-opencode-session` for managed providers (V1 `chat.headers` equivalent).
 
 See [ARCHITECTURE.md](./ARCHITECTURE.md) for full flow.
 
 ## Style
 
-- TypeScript `strict`, `module: ESNext`
-- No runtime deps — peer is `@opencode-ai/plugin`
+- TypeScript `strict`, `module: NodeNext`
+- No runtime deps — peer is `@opencode/plugin` (`^2.0.0`, host-provided at runtime)
 - Keep `src/index.ts` small and comment-light (per repo style)
 
 ## Before PR

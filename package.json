@@ -38,10 +38,10 @@
   },
   "homepage": "https://github.com/8perezm/esuyo-opencode-custom-provider#readme",
   "peerDependencies": {
-    "@opencode-ai/plugin": "^1.18.25"
+    "@opencode/plugin": "^2.0.0"
   },
   "devDependencies": {
-    "@opencode-ai/plugin": "1.18.25",
+    "@opencode/plugin": "2.0.29",
     "@types/node": "^26.4.0",
     "typescript": "^5.7.3"
   },

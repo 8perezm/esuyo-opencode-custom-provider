@@ -43,7 +43,7 @@ Full example: [`examples/esuyo-opencode-custom-provider.example.json`](../exampl
 {
   "$schema": "https://opencode.ai/config.json",
   "defaults": {
-    "npm": "@ai-sdk/openai-compatible",   // provider npm package
+    "npm": "@opencode/ai/providers/openai-compatible",   // provider runtime package (V1 "@ai-sdk/openai-compatible" still accepted, auto-mapped)
     "timeoutMs": 8000,                    // fetch /v1/models timeout
     "modelDefaults": {                    // applied to every discovered model
       "modalities": { "input": ["text", "image"], "output": ["text"] },
@@ -57,7 +57,7 @@ Full example: [`examples/esuyo-opencode-custom-provider.example.json`](../exampl
       "baseURL": "https://gateway.example.com/v1",
       "apiKey": "{env:MY_KEY}",           // see ApiKey section
       "apiKeyEnv": "MY_KEY",              // alt: env var name
-      "npm": "@ai-sdk/openai-compatible", // override defaults.npm
+      "npm": "@opencode/ai/providers/openai-compatible", // override defaults.npm
       "timeoutMs": 5000,                  // override defaults.timeoutMs
       "enabled": true,                    // false = skip
       "include": ["^esuyo/.*"],           // regex filter (allow)
@@ -128,7 +128,7 @@ Override per-provider via `modelDefaults`.
 ## Disabled / enabled providers
 
 - Per-provider: `"enabled": false` in your custom file skips it.
-- Global: `opencode.json` `disabled_providers: ["esuyo-gateway"]` or `enabled_providers: ["only-this"]` also filter (`src/index.ts:519`).
+- (V1-only, removed in V2: `opencode.json` `disabled_providers` / `enabled_providers` keys no longer exist, so the plugin does not read them.)
 
 ## Comments in JSON
 
@@ -141,7 +141,7 @@ providers. Custom gateways get `x-session-affinity` / `X-Session-Id` instead —
 which OpenCode Go flags as missing (may error after 09/06).
 
 This plugin backfills `x-opencode-session: <opencode sessionID>` via the
-`chat.headers` hook for every provider it manages. Enabled by default;
+`model.request` session hook for every provider it manages. Enabled by default;
 first-party `opencode*` providers are skipped (core already handles them) and
 unrelated providers (e.g. `anthropic` direct) are never touched.
 

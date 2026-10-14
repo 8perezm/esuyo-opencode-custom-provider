@@ -2,19 +2,40 @@
 
 ## Goal
 
-On every `opencode` start, turn any OpenAI-compatible gateway (`/v1/models`) into first-class `opencode` providers with models auto-discovered — no manual `opencode.json:provider.*.models` maintenance.
+On every `opencode` start, turn any OpenAI-compatible gateway (`/v1/models`) into first-class `opencode` providers with models auto-discovered — no manual `providers.<id>.models` maintenance in `opencode.jsonc`.
 
-## Entry
+## Entry (Opencode V2)
 
-`src/index.ts:464` exports `OpencodeCustomProviderPlugin: Plugin` (`@opencode-ai/plugin`). Opencode loads it via `plugin: ["@esuyo/esuyo-opencode-custom-provider"]` in `opencode.json` (global `~/.config/opencode/opencode.json` or project `opencode.json`).
+`src/index.ts` default-exports `Plugin.define({ id: "esuyo-custom-provider", setup })` (`@opencode/plugin`, promise API). The V2 server **requires** this shape — the V1 function export (`@opencode-ai/plugin`, `config`/`chat.headers` hooks) fails to load with `Plugin must export a default definition with an id and an effect or setup function`.
+
+For local repair/dev, Opencode 2 auto-loads the built file from the global discovery directory (explicit `plugins: ["<absolute path>"]` entries are silently ignored on Windows in 2.0.29):
+
+```
+~/.config/opencode/plugins/esuyo-custom-provider.js  <- copy of dist/index.js
+```
+
+Published installs (`opencode plugin add @esuyo/esuyo-opencode-custom-provider`) keep working via the npm path.
 
 ## Load order
 
-Per [opencode.ai/docs/plugins#load-order](https://opencode.ai/docs/plugins#load-order): global config → project config → global plugins dir → project plugins dir. Duplicate `npm` spec + version is deduped.
+Per [opencode.ai/docs/plugins](https://opencode.ai/v2/docs/plugins): global config → project config → global plugins dir → project plugins dir.
 
-## Config hook
+## Setup flow (V2)
 
-`return { config: async (config) => { ... } }` (`src/index.ts:484`) runs before models are selected.
+`setup(ctx)` must return fast — slow setups abort location activation (`ServiceUnavailableError: Location plugins did not finish activating`). So it only does local work, then syncs in the background:
+
+```
+setup(ctx)
+ ├─ loadCustomConfig(project dirs + global, env override)
+ ├─ ctx.provider.transform(editor => replay(source))   # sync, initially empty
+ ├─ ctx.session.hook("model.request", inject header)   # sync
+ └─ background (floating promise, never throws):
+     ├─ GET ${baseURL}/v1/models per provider (parallel)
+     ├─ filter include/exclude, build Model.Info[]
+     └─ source.providers = [...] → await ctx.provider.reload()
+```
+
+Compare V1 (`src ≤0.3.x`): a `config` hook mutated `config.provider[id].options/models` synchronously at startup.
 
 ### 1. Load custom config
 
@@ -35,40 +56,44 @@ OPENCODE_CUSTOM_PROVIDER_CONFIG env (absolute)
 ### 2. Filter providers
 
 - `entry.enabled === false` → skip
-- `config.disabled_providers` / `config.enabled_providers` → skip
+- (V1-only, removed: `disabled_providers` / `enabled_providers` from `opencode.json` no longer exist in V2, so they are not read.)
 
-### 3. Ensure provider in opencode config
+### 3. Provider registration (V2 transform)
 
-If `config.provider[providerId]` missing, auto-create:
-`{ npm: "@ai-sdk/openai-compatible", name: entry.name ?? id, options: { baseURL } }`.
+The `source` object accumulates `{ info, models }` per provider; the
+registered transform replays it on every reload:
+
+- new provider → `editor.add({ info, models })` with
+  `info = { ...Provider.Info.empty(id), name, activation: "enabled", package: "@opencode/ai/providers/openai-compatible", settings: { baseURL, apiKey } }`
+- existing provider → `editor.update(...)` + `editor.models.set(id, models)` (stale models removed, same as V1 replacing `provider.models`).
 
 ### 4. Resolve apiKey
 
-`resolveApiKeyAsync()` (`src/index.ts:134`): `apiKey` (`{env:}`, `{file:}`, plain) → `apiKeyEnv` → `provider.options.apiKey` → `${ID}_API_KEY`/`_TOKEN` → `ESUYO_*` fallbacks. Also reuses key from another provider with same `baseURL`.
+`resolveApiKeyAsync()`: `apiKey` (`{env:}`, `{file:}`, plain) → `apiKeyEnv` → existing registry `settings.apiKey` → `${ID}_API_KEY`/`_TOKEN` → `ESUYO_*` fallbacks. Also reuses key from another entry with same `baseURL`.
 
 ### 5. Fetch + sync models
 
-- `fetchGatewayModels(baseURL, apiKey, timeoutMs)` (`src/index.ts:397`): `GET ${baseURL}/v1/models` (handles `/v1`, `/models` suffixes), headers `Authorization: Bearer` + `x-api-key`, parses `[]` or `{data:[]}` or `{models:[]}`, dedupes by `id`.
+- `fetchGatewayModels(baseURL, apiKey, timeoutMs)`: `GET ${baseURL}/v1/models` (handles `/v1`, `/models` suffixes), headers `Authorization: Bearer` + `x-api-key`, parses `[]` or `{data:[]}` or `{models:[]}`, dedupes by `id`.
 - `filterModels()` regex `include`/`exclude`.
-- `buildModelConfig()` humanizes IDs, merges `raw.context_length` etc. into `limit`/`modalities`, respects `entry.models` static overrides and preserves existing `provider.models[id]` if present.
-- Cache per `baseURL` 30s (`src/index.ts:472`).
-- Stale models removed, new added, `provider.models = nextModels`.
+- `buildModelInfo()` humanizes IDs, merges `raw.context_length` etc. into `limit`/`capabilities`, respects `entry.models` static overrides.
+- Cache per `baseURL` 30s.
+- Stale models removed on `editor.models.set`, new added.
 
-Logs at each step via `client.app.log({ service: "opencode-custom-provider" })`.
+Logs go to stdout (`[opencode-custom-provider]` prefix).
 
 ## Error handling
 
-- No config → warn `create .opencode/opencode-custom-provider.json` and return.
-- Gateway fetch fails → keep `existingCount`, warn, don't clear models.
-- 0 models → warn, keep existing.
+- No config → warn `create .opencode/esuyo-opencode-custom-provider.json`, still registers the session hook, returns.
+- Gateway fetch fails → skip that provider, warn (registry keeps previous inventory).
+- 0 models → warn, skip sync.
 
 ## Constants
 
-`DEFAULT_NPM = "@ai-sdk/openai-compatible"`, `DEFAULT_TIMEOUT_MS = 8000`, `DEFAULT_MODEL_LIMIT = {context:200000, output:32000}`, `DEFAULT_MODALITIES = {input:["text","image"], output:["text"]}`.
+`DEFAULT_PACKAGE = "@opencode/ai/providers/openai-compatible"` (legacy `"@ai-sdk/openai-compatible"` in user config is auto-mapped), `DEFAULT_TIMEOUT_MS = 8000`, `DEFAULT_MODEL_LIMIT = {context:200000, output:32000}`, `DEFAULT_MODALITIES = {input:["text","image"], output:["text"]}`.
 
 ## File map
 
-- `src/index.ts:60-55` types
-- `src/index.ts:76-182` helpers (`humanizeModelId`, `resolveModelsUrl`, `resolveStringValue*`, `stripJsonComments`)
-- `src/index.ts:184-346` `normalizeProviders`, `loadCustomConfig`, `buildModelConfig`
-- `src/index.ts:397-651` fetch, filter, plugin export
+- types (`ProviderEntry`, `CustomConfigFile`, …)
+- helpers (`humanizeModelId`, `resolveModelsUrl`, `resolveStringValue*`, `stripJsonComments`)
+- `normalizeProviders`, `loadCustomConfig`, `buildModelInfo`
+- fetch, filter, `Plugin.define({ id, setup })`
