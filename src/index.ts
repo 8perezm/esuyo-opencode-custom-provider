@@ -2,6 +2,20 @@ import { Model, Plugin, Provider } from "@opencode/plugin"
 import fs from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
+import {
+  applyModelsDevToOpencodeInfo,
+  defaultModelsDevOptions,
+  findModelsDevMatch,
+  loadModelsDevCatalog,
+  resolveModelsDevForProvider,
+  shouldEnrichModelsDevMatch,
+} from "./models-dev.js"
+import type {
+  ModelsDevCatalogResult,
+  ModelsDevGlobalOptions,
+  ModelsDevProviderSetting,
+  NormalizedModelsDevModel,
+} from "./models-dev.js"
 
 // ---------------------------------------------------------------------------
 // Esuyo Custom Provider - generic multi-gateway plugin for Opencode V2
@@ -66,6 +80,13 @@ type ProviderEntry = {
   sendSessionHeaders?: boolean
   /** Override the injected header name for this provider only. */
   sessionHeader?: string
+  /**
+   * models.dev enrichment for this provider: `false` disables it,
+   * `true` inherits the global `modelsDev` settings, an object can toggle it
+   * or pin catalog match ranking to one models.dev provider namespace
+   * (e.g. `{ "provider": "openai" }`).
+   */
+  modelsDev?: ModelsDevProviderSetting
 }
 
 type CustomConfigFile = {
@@ -86,6 +107,12 @@ type CustomConfigFile = {
   sessionHeaders?: boolean | SessionHeadersConfig
   // also support top-level being directly providers map/array if no wrapper
   [key: string]: any
+  /**
+   * models.dev catalog enrichment (thinking/reasoning levels, input
+   * modalities, context limits). Enabled by default; degrades gracefully
+   * (bundled snapshot, then gateway-only) when the catalog is unreachable.
+   */
+  modelsDev?: ModelsDevGlobalOptions
 }
 
 const DEFAULT_SESSION_HEADER = "x-opencode-session"
@@ -237,7 +264,7 @@ function normalizeProviders(
   // Support file being directly a providers map without wrapper: { "esuyo-gateway": {baseURL...}}
   if (!providersRaw) {
     // if raw has no providers key but looks like a map of provider entries (has baseURL)
-    const keys = Object.keys(raw).filter((k) => !k.startsWith("$") && k !== "defaults" && k !== "sessionHeaders")
+    const keys = Object.keys(raw).filter((k) => !k.startsWith("$") && k !== "defaults" && k !== "sessionHeaders" && k !== "modelsDev")
     const maybeMap = keys.some((k) => {
       const v = (raw as any)[k]
       return v && typeof v === "object" && typeof v.baseURL === "string"
@@ -280,6 +307,7 @@ function normalizeProviders(
         models: entry.models,
         sendSessionHeaders: (entry as any).sendSessionHeaders,
         sessionHeader: (entry as any).sessionHeader,
+        modelsDev: (entry as any).modelsDev,
       })
     }
   } else if (typeof providersRaw === "object") {
@@ -310,6 +338,7 @@ function normalizeProviders(
         models: entry.models,
         sendSessionHeaders: entry.sendSessionHeaders,
         sessionHeader: entry.sessionHeader,
+        modelsDev: entry.modelsDev,
       })
     }
   }
@@ -487,6 +516,20 @@ function applyStaticOverrideToInfo(info: Record<string, any>, override: Record<s
   for (const key of ["capabilities", "headers", "body", "settings", "cost", "status", "enabled", "family", "compatibility"]) {
     if (override[key] !== undefined) info[key] = override[key]
   }
+  // Static `variants` replace catalog-generated reasoning-effort variants
+  // (each entry: `{ id, settings?, headers?, body? }`; invalid entries drop).
+  if (Array.isArray(override.variants)) {
+    const cleaned = override.variants
+      .filter((v) => v && typeof v === "object" && typeof (v as any).id === "string" && (v as any).id.trim())
+      .map((v: any) => {
+        const out: Record<string, any> = { id: v.id.trim() }
+        if (v.settings !== undefined) out.settings = v.settings
+        if (v.headers !== undefined) out.headers = v.headers
+        if (v.body !== undefined) out.body = v.body
+        return out
+      })
+    info.variants = cleaned
+  }
 }
 
 function buildModelInfo(
@@ -495,6 +538,9 @@ function buildModelInfo(
   raw: Record<string, any> | undefined,
   staticOverride: Record<string, any> | undefined,
   defaults: ModelDefaults | undefined,
+  modelsDevEntry?: NormalizedModelsDevModel | undefined,
+  preferGatewayOverCatalog?: boolean,
+  genModelsDevVariants?: boolean,
 ): Record<string, any> {
   // Model.Info.default(providerID, modelID) provides V2 defaults
   // (capabilities.tools=true, input [text,image], limit 200k/32k).
@@ -522,11 +568,27 @@ function buildModelInfo(
   base.providerID = providerID
   if (!base.name || base.name === id) base.name = humanizeModelId(id)
 
+  // `modelDefaults` are fallbacks: apply them before catalog/gateway metadata so
+  // real per-model values win (e.g. a generic limit.context: 256000 must not
+  // shrink a 1M-token model the catalog knows about). Hard pins belong in the
+  // static `models:` overrides, which are applied last.
+  applyModelDefaultsToInfo(base, defaults)
+
+  // models.dev enrichment sits between the defaults above and the gateway
+  // metadata below, so live gateway values win on conflict
+  // (unless preferGatewayOverCatalog is false — see the second pass below).
+  let modelsDevNamed = false
+  if (modelsDevEntry) {
+    modelsDevNamed = applyModelsDevToOpencodeInfo(base, modelsDevEntry, {
+      variants: genModelsDevVariants !== false,
+    }).named
+  }
+
   // Gateway-advertised metadata refines the defaults.
   if (raw) {
     if (typeof raw.display_name === "string" && raw.display_name.trim()) base.name = raw.display_name.trim()
     else if (typeof raw.name === "string" && raw.name.trim() && raw.name !== id) base.name = raw.name.trim()
-    else base.name = humanizeModelId(id)
+    else if (!modelsDevNamed) base.name = humanizeModelId(id)
     const ctxVal = raw.context_length ?? raw.contextLength ?? raw.limit?.context ?? raw.max_context
     if (typeof ctxVal === "number" && ctxVal > 0) {
       base.limit = base.limit ?? {}
@@ -547,7 +609,12 @@ function buildModelInfo(
     }
   }
 
-  applyModelDefaultsToInfo(base, defaults)
+  // Opt-out of gateway precedence: re-apply the catalog over gateway values
+  // (stale gateways). Static `models:` overrides below still win.
+  if (modelsDevEntry && preferGatewayOverCatalog === false) {
+    applyModelsDevToOpencodeInfo(base, modelsDevEntry, { variants: genModelsDevVariants !== false })
+  }
+
   if (staticOverride) applyStaticOverrideToInfo(base, staticOverride)
 
   // Keep capabilities/limit shapes the V2 registry expects.
@@ -776,6 +843,15 @@ export default Plugin.define({
       type SyncedProvider = { info: Record<string, any>; models: Record<string, any>[] }
       const source: { providers: SyncedProvider[] } = { providers: [] }
 
+      // models.dev catalog (thinking/reasoning levels, input modalities,
+      // context limits). Loaded once per setup, shared by all providers.
+      const modelsDevOpts = defaultModelsDevOptions(rawJson?.modelsDev)
+      // Holder object: assignments happen inside the background closure, which
+      // control-flow narrowing tracks less precisely than a plain `let`.
+      const modelsDevState: { catalog: ModelsDevCatalogResult | null } = { catalog: null }
+      let modelsDevMatched = 0
+      let modelsDevTotal = 0
+
       const syncOne = async ([providerId, entry]: [string, ProviderEntry]): Promise<void> => {
         const enabled = entry.enabled !== false
         if (!enabled) {
@@ -844,10 +920,25 @@ export default Plugin.define({
           sample: discovered.slice(0, 3).map((m) => m.id),
         })
 
+        // models.dev enrichment for this provider (single resolution shared by
+        // every model below).
+        const mdTarget = resolveModelsDevForProvider(modelsDevOpts, entry.modelsDev)
+        const genMdVariants = mdTarget.variants !== false
+        const lookupModelsDevModel = (modelId: string): NormalizedModelsDevModel | undefined => {
+          if (!modelsDevState.catalog || !mdTarget.enabled) return undefined
+          const match = findModelsDevMatch(modelId, modelsDevState.catalog, mdTarget.provider)
+          if (!match) return undefined
+          if (!shouldEnrichModelsDevMatch(match.entry, modelsDevOpts)) return undefined
+          return match.entry
+        }
+
         const models: Record<string, any>[] = []
         for (const { id, raw } of discovered) {
           const staticOverride = entry.models?.[id]
-          models.push(buildModelInfo(providerId, id, raw, staticOverride, entry.modelDefaults))
+          const mdEntry = lookupModelsDevModel(id)
+          if (mdEntry) modelsDevMatched++
+          modelsDevTotal++
+          models.push(buildModelInfo(providerId, id, raw, staticOverride, entry.modelDefaults, mdEntry, modelsDevOpts.preferGateway, genMdVariants))
         }
 
         // Preserve explicitly configured static models absent from the gateway.
@@ -855,7 +946,10 @@ export default Plugin.define({
           const seen = new Set(models.map((m) => m.id))
           for (const [mid, mcfg] of Object.entries(entry.models)) {
             if (!seen.has(mid)) {
-              models.push(buildModelInfo(providerId, mid, undefined, mcfg, entry.modelDefaults))
+              const mdEntry = lookupModelsDevModel(mid)
+              if (mdEntry) modelsDevMatched++
+              modelsDevTotal++
+              models.push(buildModelInfo(providerId, mid, undefined, mcfg, entry.modelDefaults, mdEntry, modelsDevOpts.preferGateway, genMdVariants))
               log("info", `Keeping static model ${mid} for ${providerId} not in gateway`, { providerId, modelId: mid })
             }
           }
@@ -923,19 +1017,40 @@ export default Plugin.define({
         }
       })
 
-      // Background sync: fetch gateway inventories, then reload the provider
-      // registry so the transform above replays with real data. Floating
-      // promise — never blocks setup, never throws (all errors are logged).
+      // Background sync: fetch gateway inventories and the models.dev catalog
+      // concurrently (the catalog is text, the gateway can be slow), then
+      // reload the provider registry so the transform above replays with real
+      // data. Floating promise — never blocks setup, never throws (all errors
+      // are logged).
       void (async () => {
         try {
-          await Promise.allSettled(Object.entries(providerEntries).map(syncOne))
+          const anyModelsDevEnabled = Object.values(providerEntries).some(
+            (e) => resolveModelsDevForProvider(modelsDevOpts, (e as ProviderEntry).modelsDev).enabled,
+          )
+          const catalogPromise =
+            modelsDevOpts.enabled && anyModelsDevEnabled
+              ? loadModelsDevCatalog(modelsDevOpts, log)
+              : null
+          if (!catalogPromise) {
+            log("info", "models.dev enrichment disabled, using gateway metadata only")
+          }
+          const syncProvider = async (entry: [string, ProviderEntry]) => {
+            if (catalogPromise) modelsDevState.catalog = await catalogPromise
+            await syncOne(entry)
+          }
+          await Promise.allSettled(Object.entries(providerEntries).map(syncProvider))
           const synced = source.providers
           if (synced.length === 0) {
             log("warn", "Opencode Custom Provider sync produced no providers (all fetches failed or filtered out)")
             return
           }
           await ctx.provider.reload()
-          log("info", "Opencode Custom Provider sync complete", { providers: synced.map((s) => s.info.id) })
+          log("info", "Opencode Custom Provider sync complete", {
+            providers: synced.map((s) => s.info.id),
+            modelsDev: modelsDevState.catalog
+              ? { source: modelsDevState.catalog.source, matched: `${modelsDevMatched}/${modelsDevTotal}` }
+              : "disabled",
+          })
         } catch (err: any) {
           log("error", `Background sync failed: ${err?.message ?? String(err)}`)
         }

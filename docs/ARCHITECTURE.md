@@ -27,10 +27,14 @@ Per [opencode.ai/docs/plugins](https://opencode.ai/v2/docs/plugins): global conf
 ```
 setup(ctx)
  ├─ loadCustomConfig(project dirs + global, env override)
+ ├─ loadModelsDevCatalog() once (live fetch, snapshot fallback, TTL-cached;
+ │   skipped when every provider opts out via `modelsDev: false`)
  ├─ ctx.provider.transform(editor => replay(source))   # sync, initially empty
  ├─ ctx.session.hook("model.request", inject header)   # sync
  └─ background (floating promise, never throws):
-     ├─ GET ${baseURL}/v1/models per provider (parallel)
+     ├─ for each provider: GET ${baseURL}/v1/models (parallel)
+     ├─ per model: findModelsDevMatch(id) → enrich capabilities/limit/cost
+     │   (gateway raw > catalog by default; static `models:` entries win)
      ├─ filter include/exclude, build Model.Info[]
      └─ source.providers = [...] → await ctx.provider.reload()
 ```

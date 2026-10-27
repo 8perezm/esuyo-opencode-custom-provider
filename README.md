@@ -148,6 +148,18 @@ You can filter models, set timeouts, or add a second gateway. It’s all optiona
 
 See the full example at [`examples/esuyo-opencode-custom-provider.example.json`](./examples/esuyo-opencode-custom-provider.example.json).
 
+**Automatic model details (thinking, images, context):** gateways usually
+only report bare model IDs. By default the plugin looks each model up in the
+[models.dev](https://models.dev) catalog and fills in thinking/reasoning
+support (as `/variants` you can select, e.g. `esuyo-gateway/model:high`),
+image input support, context/output limits, pricing, and display names — so
+`opencode models` shows real limits without you configuring them.
+It works offline too (bundled snapshot fallback). To opt out per provider,
+set `"modelsDev": false` (or `"modelsDev": { "variants": false }` for
+enrichment without variants); custom gateway models the catalog doesn't know
+get no variants unless you define them via a static `models:` override — see
+[Advanced Configuration](./docs/CONFIGURATION.md#modelsdev-enrichment-thinking-levels-input-types-context-limits).
+
 **For grown-ups who want every option, see:**
 
 - 📖 [Advanced Configuration](./docs/CONFIGURATION.md) — every `apiKey`, `include`, `modelDefaults` trick

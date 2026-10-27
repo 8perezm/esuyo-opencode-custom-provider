@@ -25,15 +25,17 @@ npm ci
 | `npm run build` | `tsc` → `dist/` (what npm publishes) |
 | `npm run dev` | `tsc --watch` |
 | `npm run typecheck` | `tsc --noEmit` |
-| `npm test` | No tests yet (`echo "No tests"`). Add vitest/jest if you add tests. |
+| `npm test` | `npm run build` then `node --test test/` (unit + mock-ctx integration, no network) |
 
 `package.json:prepublishOnly` runs `build` automatically before `npm publish`.
 
 ## Project layout
 
 ```
-src/index.ts            # entire plugin (~650 lines)
+src/index.ts            # plugin setup, gateway sync, session headers
+src/models-dev.ts       # models.dev catalog: match + enrich (limits, variants)
 dist/                   # built output (git-ignored, published)
+test/                   # node:test suites (unit + integration with fake gateway)
 examples/               # example custom-provider json
 docs/                   # you are here
 .github/workflows/publish.yml  # CI: auto bump + publish
@@ -43,7 +45,55 @@ docs/                   # you are here
 
 ## Testing locally
 
-### Option A — local file plugin (fastest)
+### Option A — repo directory (recommended for development)
+
+Opencode 2 resolves a configured local plugin **directory** by importing its
+`server` or `index` module — a `package.json` `main` field is *not* consulted.
+This repo ships a root `index.js` that re-exports `dist/index.js` so it can be
+used directly (and so `@opencode-ai/models` resolves from the repo's own
+`node_modules`):
+
+```bash
+npm install        # once
+npm run build      # required: index.js re-exports dist/
+
+# ~/.config/opencode/opencode.json
+#   "plugins": ["/absolute/path/to/esuyo-opencode-custom-provider"]
+opencode service restart
+opencode models    # should list esuyo-gateway/...
+```
+
+If the entrypoint is missing/misnamed, Opencode loads nothing and logs no
+error — verify with:
+
+```bash
+opencode models --standalone --print-logs 2>&1 | grep -E "loading plugin|opencode-custom-provider"
+```
+
+You should see `loading plugin ... entrypoint=file:///.../index.js` followed by
+`Opencode Custom Provider sync complete { providers: [...] }`.
+
+### Inspecting the model JSON Opencode actually sees
+
+`opencode models` only prints IDs. To print the full enriched `Model.Info`
+JSON (limits, capabilities, cost, variants) exactly as the TUI receives it:
+
+```bash
+npm run models:json -- --provider esuyo-gateway
+node scripts/models-json.mjs --provider esuyo-gateway --id muse-spark-1.3
+npm run --silent models:json -- --provider esuyo-gateway | jq '.[0].limit'
+```
+
+(`--silent` avoids npm's banner when piping; running the script with `node`
+directly avoids it too.)
+
+The script starts a private `opencode serve`, waits for the plugin's background
+sync (gateway fetch + models.dev enrichment), queries `GET /api/model`, prints
+the JSON, and stops the server. Credentials are redacted; pass
+`--show-secrets` to include them. Use `--server <url> --password <pw>` to query
+an already-running server instead (credentials are printed by `opencode serve`).
+
+### Option B — copy the built file into the discovery dir
 
 Opencode 2 auto-loads `~/.config/opencode/plugins/*.js` (and
 `.opencode/plugins/` per project) — no npm cache involved. The file must be
@@ -57,12 +107,12 @@ opencode reload
 opencode models  # should list esuyo-gateway/...
 ```
 
-> Explicit `plugins: ["./local/path"]` entries in `opencode.json` are
-> silently ignored by Opencode 2.0.29 on Windows — use the `plugins/`
-> discovery directory instead. Re-copy after every build (the file is a
-> snapshot, not a link).
+> A copied `dist/index.js` cannot resolve `@opencode-ai/models` (it lives in
+> the repo's `node_modules`), so models.dev enrichment silently degrades to
+> gateway metadata only. Use Option A when testing enrichment/variants.
+> Re-copy after every build (the file is a snapshot, not a link).
 
-### Option B — npm link
+### Option C — npm link
 
 ```bash
 npm link

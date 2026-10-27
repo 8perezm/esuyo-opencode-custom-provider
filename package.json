@@ -18,6 +18,8 @@
     "build": "tsc",
     "dev": "tsc --watch",
     "typecheck": "tsc --noEmit",
+    "test": "npm run build && node --test test/",
+    "models:json": "node scripts/models-json.mjs",
     "echo-gateway": "node scripts/echo-gateway.mjs",
     "prepublishOnly": "npm run build"
   },
@@ -39,6 +41,9 @@
   "homepage": "https://github.com/8perezm/esuyo-opencode-custom-provider#readme",
   "peerDependencies": {
     "@opencode/plugin": "^2.0.0"
+  },
+  "dependencies": {
+    "@opencode-ai/models": "^0.0.116"
   },
   "devDependencies": {
     "@opencode/plugin": "2.0.29",

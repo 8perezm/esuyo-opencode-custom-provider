@@ -24,7 +24,8 @@
     "esuyo-gateway": {
       "name": "Esuyo Gateway",
       "baseURL": "https://gateway.example.com/v1",
-      "apiKey": "{env:ESUYO_GATEWAY_API_KEY}"
+      "apiKey": "{env:ESUYO_GATEWAY_API_KEY}",
+      "modelsDev": { "enabled": true }
     },
     "second-gateway": {
       "name": "Second Gateway",
@@ -43,5 +44,10 @@
   "sessionHeaders": {
     "enabled": true,
     "header": "x-opencode-session"
+  },
+  "modelsDev": {
+    "enabled": true,
+    "preferGateway": true,
+    "excludeTypes": []
   }
 }

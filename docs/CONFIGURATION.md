@@ -123,7 +123,106 @@ $env:ESUYO_GATEWAY_API_KEY="sk-..."
 
 If gateway returns `context_length`, `max_output_tokens`, `supports_vision` etc., they are merged into the model config (`src/index.ts:348`). `humanizeModelId()` turns `esuyo/opencode/qwen3.8-flash` → `Qwen3.8 Flash`.
 
-Override per-provider via `modelDefaults`.
+`modelDefaults` (global or per-provider) are **fallbacks**, not overrides: they
+only fill values no better source provides. A generic
+`"modelDefaults": { "limit": { "context": 256000 } }` therefore no longer
+shrinks a model the catalog knows is 1M tokens. To hard-pin a specific model,
+use a static `models:` entry (applied last, always wins).
+
+### Precedence
+
+`built-in defaults < modelDefaults < models.dev < gateway /v1/models < static
+models: overrides`
+
+Live gateway values win over the catalog by default (`preferGateway: false`
+swaps those two); static `models:` entries always win.
+
+## models.dev enrichment (thinking levels, input types, context limits)
+
+Gateways usually expose `/v1/models` as bare IDs with no metadata. When
+enabled (the default), the plugin looks each discovered model up in the
+[models.dev](https://models.dev) catalog (via the `@opencode-ai/models`
+client) and maps the result onto `Model.Info`:
+
+| models.dev | Opencode `Model.Info` | Why it matters |
+|---|---|---|
+| `modalities.input` / `.output` | `capabilities.input` / `.output` | image/pdf/video support in the picker |
+| `tool_call` | `capabilities.tools` | function-calling capability |
+| `reasoning_options` effort values | `variants` | `/variants` lists e.g. `low`/`medium`/`high`; select as `provider/model:high` |
+| `limit.context` / `.input` / `.output` | `limit` | compaction + max tokens |
+| `cost` (+ context tiers) | `cost` | cost display |
+| `family`, `status` | `family`, `status` | grouping, deprecated flags |
+| `name` | `name` | only when the gateway has no display name |
+
+Each effort variant carries `settings: { reasoningEffort: "<level>" }` — the
+option name the `openai-compatible` provider maps onto the `reasoning_effort`
+request parameter. Variants only take effect when you explicitly select them,
+so generating them is safe even for endpoints that ignore the parameter.
+Toggle-only or budget-only models expose no discrete levels and get no
+variants; neither do non-chat types (`embedding`, …) or non-reasoning models.
+No catalog match (e.g. a custom gateway model unknown to models.dev) also
+means no variants — define them yourself via a static `models:` override
+(see below), or disable generation with `"variants": false`.
+
+Precedence per field: built-in defaults < `modelDefaults` < models.dev <
+gateway `/v1/models` < static `models:` overrides. So live gateway values win
+on conflict; set `preferGateway: false` to let the catalog win instead (useful
+for stale gateways). `modelDefaults` act as fallbacks — they never shrink a
+value the catalog or gateway reports.
+
+Matching: exact ID matches win; otherwise the last `/`-separated segment is
+compared case-insensitively (`esuyo/opencode/qwen3.8-flash` → `qwen3.8-flash`).
+Ambiguous suffixes resolve deterministically: exact string > pinned provider >
+**canonical owner** (the provider namespace that owns the model's
+`canonical_model_id`, e.g. `meta` for `meta/muse-spark-1.3`) > unlinked
+"lab original" entries > non-deprecated. Canonical owners carry authoritative
+capabilities: some reseller mirrors advertise extra reasoning levels (e.g.
+`max`) that the real deployment does not support, so they must not win. This
+also keeps pricing near list price. Entries with a non-chat `type` (e.g.
+`embedding`, `image`) only enrich factual fields (name/limit/cost/family/status)
+— capability fields are left alone. To force a specific catalog namespace for a
+provider (e.g. a gateway that re-serves a known upstream), set
+`"modelsDev": { "provider": "opencode-go" }`.
+
+The catalog is fetched once per setup (shared by all providers) and cached in
+memory for `cacheTtlMs`. If the live fetch fails, the bundled snapshot from
+`@opencode-ai/models` (at most ~24h old) is used; if that is unavailable too,
+the plugin falls back to gateway-only metadata with a warning.
+
+```json
+{
+  "modelsDev": {
+    "enabled": true,          // false = gateway metadata only
+    "baseUrl": "https://models.dev",
+    "timeoutMs": 8000,
+    "cacheTtlMs": 3600000,    // 1h in-memory cache
+    "modelTypes": "all",       // "all" (?type=all) or "standard"
+    "preferGateway": true,     // false = catalog wins over gateway metadata
+    "variants": true,          // false = no reasoning-effort variants
+    "excludeDeprecated": false,
+    "excludeTypes": ["embedding"],  // skip enrichment for these model types
+    "provider": "openai"       // optional global namespace pin for matching
+  },
+  "providers": {
+    "my-gateway": {
+      "baseURL": "https://gateway.example.com/v1",
+      "apiKey": "{env:MY_KEY}",
+      "modelsDev": { "enabled": true, "provider": "openai", "variants": true },
+      // ...or "modelsDev": false to opt this provider out
+      "models": {
+        // Static overrides win over the catalog. Define `variants` yourself
+        // for gateway models the catalog doesn't know (or `[]` to clear
+        // catalog-generated variants for a model):
+        "my-custom-model": {
+          "name": "My Custom Model",
+          "limit": { "context": 200000, "output": 32000 },
+          "variants": [{ "id": "high", "settings": { "reasoningEffort": "high" } }]
+        }
+      }
+    }
+  }
+}
+```
 
 ## Disabled / enabled providers
 
